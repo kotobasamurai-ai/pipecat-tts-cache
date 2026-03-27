@@ -20,14 +20,17 @@ from pipecat_tts_cache.models import CachedTTSResponse
 class MemoryCacheBackend(CacheBackend):
     """In-memory LRU cache with TTL support."""
 
-    def __init__(self, max_size: int = 1000):
+    def __init__(self, max_size: int = 1000, refresh_ttl_on_hit: bool = True):
         """Initialize in-memory cache backend.
 
         Args:
             max_size: Maximum number of cache entries to store.
+            refresh_ttl_on_hit: When True, each cache hit resets the entry's TTL
+                so frequently accessed phrases stay cached indefinitely.
         """
-        self._cache: OrderedDict[str, Tuple[CachedTTSResponse, float]] = OrderedDict()
+        self._cache: OrderedDict[str, Tuple[CachedTTSResponse, float, int]] = OrderedDict()
         self._max_size = max_size
+        self._refresh_ttl_on_hit = refresh_ttl_on_hit
         self._lock = asyncio.Lock()
         self._hits = 0
         self._misses = 0
@@ -35,18 +38,27 @@ class MemoryCacheBackend(CacheBackend):
         logger.debug(f"Initialized MemoryCacheBackend: max_size={max_size}")
 
     async def get(self, key: str) -> Optional[CachedTTSResponse]:
-        """Retrieve cached response, or None if not found/expired."""
+        """Retrieve cached response, or None if not found/expired.
+
+        When refresh_ttl_on_hit is enabled, a successful get resets the
+        entry's expiry so frequently used phrases stay cached.
+        """
         async with self._lock:
             if key not in self._cache:
                 self._misses += 1
                 return None
 
-            response, expiry = self._cache[key]
+            response, expiry, original_ttl = self._cache[key]
 
             if expiry > 0 and time.time() > expiry:
                 del self._cache[key]
                 self._misses += 1
                 return None
+
+            # Refresh TTL on hit
+            if self._refresh_ttl_on_hit and original_ttl > 0:
+                new_expiry = time.time() + original_ttl
+                self._cache[key] = (response, new_expiry, original_ttl)
 
             self._cache.move_to_end(key)
             self._hits += 1
@@ -62,7 +74,7 @@ class MemoryCacheBackend(CacheBackend):
                     self._cache.popitem(last=False)
                     self._evictions += 1
 
-                self._cache[key] = (response, expiry)
+                self._cache[key] = (response, expiry, ttl or 0)
                 self._cache.move_to_end(key)
                 return True
 
@@ -97,7 +109,7 @@ class MemoryCacheBackend(CacheBackend):
             if key not in self._cache:
                 return False
 
-            _, expiry = self._cache[key]
+            _, expiry, _ = self._cache[key]
             if expiry > 0 and time.time() > expiry:
                 del self._cache[key]
                 return False
