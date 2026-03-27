@@ -28,7 +28,9 @@ from .backends.base import CacheBackend
 from .key_generator import generate_cache_key
 from .models import CachedAudioChunk, CachedTTSResponse, CachedWordTimestamp
 
-_CACHE_ORIGIN_ATTR = "_tts_cache_origin"
+_CACHE_ORIGIN_KEY = "_tts_cache_origin"
+_WORD_SPLIT_RE = re.compile(r"[^\w\s']")
+_BYTES_PER_PCM_SAMPLE = 2
 
 
 @dataclass
@@ -74,7 +76,16 @@ class TTSCacheMixin:
         self._batch_cache_tasks: List[BatchCacheTask] = []
         self._batch_audio_buffer: List[CachedAudioChunk] = []
         self._batch_word_timestamps: List[Tuple[str, float]] = []
-        self._supports_word_timestamps = hasattr(self, "start_word_timestamps")
+
+        # Cache capability checks resolved once at init (MRO is static).
+        self._has_parent_add_word_timestamps = hasattr(super(), "add_word_timestamps")
+        self._has_parent_handle_interruption = hasattr(super(), "_handle_interruption")
+        if hasattr(self, "_settings") and hasattr(self._settings, "given_fields"):
+            self._settings_mode = "modern"
+        elif hasattr(self, "_settings"):
+            self._settings_mode = "modern_no_given_fields"
+        else:
+            self._settings_mode = "legacy"
 
         if self._enable_cache:
             logger.info(
@@ -82,7 +93,7 @@ class TTSCacheMixin:
                 f"ttl={cache_ttl}s, namespace={cache_namespace or 'default'}, "
             )
 
-            if not self._supports_word_timestamps:
+            if not hasattr(self, "start_word_timestamps"):
                 logger.debug(
                     "TTS service does not support word timestamps. Only single-sentence "
                     "responses will be cached."
@@ -92,45 +103,34 @@ class TTSCacheMixin:
 
     def _generate_cache_key(self, text: str) -> str:
         """Generate cache key for the current TTS request."""
-        # Modern pipecat stores voice/model in _settings (a ServiceSettings dataclass).
-        # Fall back to legacy _voice_id / model_name for older service implementations.
-        voice_id = "default"
-        model = "default"
-        settings_dict: Dict[str, Any] = {}
-
-        if hasattr(self, "_settings"):
+        if self._settings_mode == "modern":
             settings_obj = self._settings
             voice_id = getattr(settings_obj, "voice", None) or "default"
             model = getattr(settings_obj, "model", None) or "default"
-            # given_fields() returns a dict of all non-NOT_GIVEN fields
-            if hasattr(settings_obj, "given_fields"):
-                settings_dict = settings_obj.given_fields()
-            else:
-                settings_dict = {}
+            settings_dict = settings_obj.given_fields()
+        elif self._settings_mode == "modern_no_given_fields":
+            settings_obj = self._settings
+            voice_id = getattr(settings_obj, "voice", None) or "default"
+            model = getattr(settings_obj, "model", None) or "default"
+            settings_dict = {}
         else:
-            # Legacy fallback
             voice_id = getattr(self, "_voice_id", "default")
             model = getattr(self, "model_name", "default")
-            settings_dict = getattr(self, "_settings", {})
-            if not isinstance(settings_dict, dict):
-                settings_dict = {}
-
-        sample_rate = getattr(self, "sample_rate", 16000)
+            settings_dict = {}
 
         return generate_cache_key(
             text=text,
             voice_id=str(voice_id),
             model=str(model),
-            sample_rate=sample_rate,
+            sample_rate=getattr(self, "sample_rate", 16000),
             settings=settings_dict,
             namespace=self._cache_namespace,
         )
 
     def _parse_words_from_text(self, text: str) -> List[str]:
         """Parse words from text to match TTS word segmentation."""
-        cleaned = re.sub(r"[^\w\s']", "", text)
-        words = [w for w in cleaned.split() if w]
-        return words
+        cleaned = _WORD_SPLIT_RE.sub("", text)
+        return [w for w in cleaned.split() if w]
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Run TTS with caching support.
@@ -187,7 +187,7 @@ class TTSCacheMixin:
     ) -> AsyncGenerator[Frame, None]:
         """Replay frames from cache with proper context_id."""
         started_frame = TTSStartedFrame(context_id=context_id)
-        setattr(started_frame, _CACHE_ORIGIN_ATTR, True)
+        started_frame.metadata[_CACHE_ORIGIN_KEY] = True
         yield started_frame
 
         if hasattr(self, "start_word_timestamps") and cached.word_timestamps:
@@ -207,23 +207,23 @@ class TTSCacheMixin:
                 num_channels=chunk.num_channels,
                 context_id=context_id,
             )
-            setattr(frame, _CACHE_ORIGIN_ATTR, True)
+            frame.metadata[_CACHE_ORIGIN_KEY] = True
             yield frame
 
         stopped_frame = TTSStoppedFrame(context_id=context_id)
-        setattr(stopped_frame, _CACHE_ORIGIN_ATTR, True)
+        stopped_frame.metadata[_CACHE_ORIGIN_KEY] = True
         yield stopped_frame
 
     async def _add_word_timestamps_from_cache(
         self, word_times: List[Tuple[str, float]], context_id: str
     ):
         """Add word timestamps from cache without collecting them."""
-        if hasattr(super(), "add_word_timestamps"):
+        if self._has_parent_add_word_timestamps:
             await super().add_word_timestamps(word_times, context_id=context_id)
 
     def _is_from_cache(self, frame: Frame) -> bool:
         """Check if a frame originated from cache replay."""
-        return getattr(frame, _CACHE_ORIGIN_ATTR, False)
+        return frame.metadata.get(_CACHE_ORIGIN_KEY, False)
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Override push_frame to intercept audio frames for caching."""
@@ -251,7 +251,7 @@ class TTSCacheMixin:
         if self._batch_cache_tasks and filtered_times:
             self._batch_word_timestamps.extend(filtered_times)
 
-        if hasattr(super(), "add_word_timestamps"):
+        if self._has_parent_add_word_timestamps:
             await super().add_word_timestamps(word_times, context_id=context_id)
 
     async def _finalize_batch_cache_tasks(self):
@@ -270,12 +270,9 @@ class TTSCacheMixin:
         sample_rate = self._batch_audio_buffer[0].sample_rate
         num_channels = self._batch_audio_buffer[0].num_channels
 
-        has_timestamps = len(self._batch_word_timestamps) > 0
-
-        if not has_timestamps:
-            # No word timestamps available — can only cache single-sentence responses.
+        if not self._batch_word_timestamps:
             if len(self._batch_cache_tasks) == 1:
-                await self._finalize_single_task_no_timestamps(
+                await self._finalize_single_task(
                     self._batch_cache_tasks[0], all_audio, sample_rate, num_channels
                 )
             else:
@@ -288,7 +285,7 @@ class TTSCacheMixin:
             return
 
         if len(self._batch_cache_tasks) == 1:
-            await self._finalize_single_task_with_timestamps(
+            await self._finalize_single_task(
                 self._batch_cache_tasks[0], all_audio, sample_rate, num_channels
             )
             return
@@ -304,8 +301,8 @@ class TTSCacheMixin:
             self._clear_batch_state()
             return
 
-        bytes_per_sample = 2 * num_channels  # 16-bit PCM
-        total_duration = len(all_audio) / (sample_rate * bytes_per_sample)
+        bytes_per_sample = _BYTES_PER_PCM_SAMPLE * num_channels
+        total_duration = self._audio_duration(all_audio, sample_rate, num_channels)
         current_word_idx = 0
 
         for task in self._batch_cache_tasks:
@@ -355,41 +352,25 @@ class TTSCacheMixin:
 
         self._clear_batch_state()
 
-    async def _finalize_single_task_with_timestamps(
-        self, task, all_audio, sample_rate, num_channels
-    ):
-        """Cache single task with timestamps (no word alignment required)."""
-        bytes_per_sample = 2 * num_channels
-        total_duration = len(all_audio) / (sample_rate * bytes_per_sample)
-
+    async def _finalize_single_task(self, task, all_audio, sample_rate, num_channels):
+        """Cache a single task, with or without word timestamps."""
+        duration = self._audio_duration(all_audio, sample_rate, num_channels)
         timestamps = [
             CachedWordTimestamp(word=w, timestamp=t) for w, t in self._batch_word_timestamps
         ]
-
         await self._store_response(
             task=task,
             audio=all_audio,
             sample_rate=sample_rate,
             num_channels=num_channels,
             timestamps=timestamps,
-            duration=total_duration,
+            duration=duration,
         )
         self._clear_batch_state()
 
-    async def _finalize_single_task_no_timestamps(self, task, all_audio, sample_rate, num_channels):
-        """Store audio for a single task when word timestamps are unavailable."""
-        bytes_per_sample = 2 * num_channels  # 16-bit PCM
-        total_duration = len(all_audio) / (sample_rate * bytes_per_sample)
-
-        await self._store_response(
-            task=task,
-            audio=all_audio,
-            sample_rate=sample_rate,
-            num_channels=num_channels,
-            timestamps=[],
-            duration=total_duration,
-        )
-        self._clear_batch_state()
+    @staticmethod
+    def _audio_duration(audio: bytes, sample_rate: int, num_channels: int) -> float:
+        return len(audio) / (sample_rate * _BYTES_PER_PCM_SAMPLE * num_channels)
 
     async def _store_response(self, task, audio, sample_rate, num_channels, timestamps, duration):
         """Shared helper to write to backend."""
@@ -429,7 +410,7 @@ class TTSCacheMixin:
             )
             self._clear_batch_state()
 
-        if hasattr(super(), "_handle_interruption"):
+        if self._has_parent_handle_interruption:
             await super()._handle_interruption(frame, direction)
 
     async def get_cache_stats(self) -> Dict[str, Any]:
