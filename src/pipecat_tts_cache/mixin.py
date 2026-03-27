@@ -4,7 +4,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""TTS caching mixin for reducing API costs on repeated phrases."""
+"""TTS caching mixin for reducing API costs on repeated phrases.
+
+Updated for compatibility with pipecat-ai >= 0.0.104 (context_id-aware API).
+"""
 
 import inspect
 import re
@@ -89,12 +92,37 @@ class TTSCacheMixin:
 
     def _generate_cache_key(self, text: str) -> str:
         """Generate cache key for the current TTS request."""
+        # Modern pipecat stores voice/model in _settings (a ServiceSettings dataclass).
+        # Fall back to legacy _voice_id / model_name for older service implementations.
+        voice_id = "default"
+        model = "default"
+        settings_dict: Dict[str, Any] = {}
+
+        if hasattr(self, "_settings"):
+            settings_obj = self._settings
+            voice_id = getattr(settings_obj, "voice", None) or "default"
+            model = getattr(settings_obj, "model", None) or "default"
+            # given_fields() returns a dict of all non-NOT_GIVEN fields
+            if hasattr(settings_obj, "given_fields"):
+                settings_dict = settings_obj.given_fields()
+            else:
+                settings_dict = {}
+        else:
+            # Legacy fallback
+            voice_id = getattr(self, "_voice_id", "default")
+            model = getattr(self, "model_name", "default")
+            settings_dict = getattr(self, "_settings", {})
+            if not isinstance(settings_dict, dict):
+                settings_dict = {}
+
+        sample_rate = getattr(self, "sample_rate", 16000)
+
         return generate_cache_key(
             text=text,
-            voice_id=getattr(self, "_voice_id", "default"),
-            model=getattr(self, "model_name", "default"),
-            sample_rate=getattr(self, "sample_rate", 16000),
-            settings=getattr(self, "_settings", {}),
+            voice_id=str(voice_id),
+            model=str(model),
+            sample_rate=sample_rate,
+            settings=settings_dict,
             namespace=self._cache_namespace,
         )
 
@@ -104,13 +132,15 @@ class TTSCacheMixin:
         words = [w for w in cleaned.split() if w]
         return words
 
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Run TTS with caching support.
 
-        This method wraps the parent's run_tts() method with caching logic.
+        Args:
+            text: The text to synthesize.
+            context_id: Unique identifier for this TTS context.
         """
         if not self._enable_cache:
-            async for frame in super().run_tts(text):
+            async for frame in super().run_tts(text, context_id):
                 yield frame
             return
 
@@ -122,7 +152,7 @@ class TTSCacheMixin:
             logger.debug(
                 f"Cache hit: '{text[:50]}...' ({len(cached_response.audio_chunks)} chunks)"
             )
-            async for frame in self._yield_cached_frames(cached_response):
+            async for frame in self._yield_cached_frames(cached_response, context_id):
                 yield frame
             return
 
@@ -137,7 +167,7 @@ class TTSCacheMixin:
         self._batch_cache_tasks.append(task)
 
         try:
-            async for frame in super().run_tts(text):
+            async for frame in super().run_tts(text, context_id):
                 yield frame
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
@@ -152,9 +182,11 @@ class TTSCacheMixin:
             logger.warning(f"Cache get failed: {e}")
             return None
 
-    async def _yield_cached_frames(self, cached: CachedTTSResponse) -> AsyncGenerator[Frame, None]:
-        """Replay frames from cache."""
-        started_frame = TTSStartedFrame()
+    async def _yield_cached_frames(
+        self, cached: CachedTTSResponse, context_id: str
+    ) -> AsyncGenerator[Frame, None]:
+        """Replay frames from cache with proper context_id."""
+        started_frame = TTSStartedFrame(context_id=context_id)
         setattr(started_frame, _CACHE_ORIGIN_ATTR, True)
         yield started_frame
 
@@ -166,25 +198,28 @@ class TTSCacheMixin:
                 (wt.word, wt.timestamp) for wt in cached.word_timestamps
             ]
             if hasattr(self, "add_word_timestamps"):
-                await self._add_word_timestamps_from_cache(word_times)
+                await self._add_word_timestamps_from_cache(word_times, context_id)
 
         for chunk in cached.audio_chunks:
             frame = TTSAudioRawFrame(
                 audio=chunk.audio,
                 sample_rate=chunk.sample_rate,
                 num_channels=chunk.num_channels,
+                context_id=context_id,
             )
             setattr(frame, _CACHE_ORIGIN_ATTR, True)
             yield frame
 
-        stopped_frame = TTSStoppedFrame()
+        stopped_frame = TTSStoppedFrame(context_id=context_id)
         setattr(stopped_frame, _CACHE_ORIGIN_ATTR, True)
         yield stopped_frame
 
-    async def _add_word_timestamps_from_cache(self, word_times: List[Tuple[str, float]]):
+    async def _add_word_timestamps_from_cache(
+        self, word_times: List[Tuple[str, float]], context_id: str
+    ):
         """Add word timestamps from cache without collecting them."""
         if hasattr(super(), "add_word_timestamps"):
-            await super().add_word_timestamps(word_times)
+            await super().add_word_timestamps(word_times, context_id=context_id)
 
     def _is_from_cache(self, frame: Frame) -> bool:
         """Check if a frame originated from cache replay."""
@@ -207,7 +242,9 @@ class TTSCacheMixin:
 
         await super().push_frame(frame, direction)
 
-    async def add_word_timestamps(self, word_times: List[Tuple[str, float]]):
+    async def add_word_timestamps(
+        self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
+    ):
         """Intercept word timestamps for caching."""
         filtered_times = [(w, t) for w, t in word_times if w not in ("TTSStoppedFrame", "Reset")]
 
@@ -215,7 +252,7 @@ class TTSCacheMixin:
             self._batch_word_timestamps.extend(filtered_times)
 
         if hasattr(super(), "add_word_timestamps"):
-            await super().add_word_timestamps(word_times)
+            await super().add_word_timestamps(word_times, context_id=context_id)
 
     async def _finalize_batch_cache_tasks(self):
         """Split batch audio by word boundaries and store each task."""
@@ -233,7 +270,10 @@ class TTSCacheMixin:
         sample_rate = self._batch_audio_buffer[0].sample_rate
         num_channels = self._batch_audio_buffer[0].num_channels
 
-        if not self._supports_word_timestamps:
+        has_timestamps = len(self._batch_word_timestamps) > 0
+
+        if not has_timestamps:
+            # No word timestamps available — can only cache single-sentence responses.
             if len(self._batch_cache_tasks) == 1:
                 await self._finalize_single_task_no_timestamps(
                     self._batch_cache_tasks[0], all_audio, sample_rate, num_channels
@@ -245,14 +285,6 @@ class TTSCacheMixin:
                     "can be cached with this TTS service."
                 )
                 self._clear_batch_state()
-            return
-
-        if len(self._batch_word_timestamps) == 0:
-            logger.warning(
-                f"No word timestamps received for {len(self._batch_cache_tasks)} tasks, "
-                "skipping cache"
-            )
-            self._clear_batch_state()
             return
 
         if len(self._batch_cache_tasks) == 1:
