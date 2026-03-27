@@ -32,6 +32,8 @@ class RedisCacheBackend(CacheBackend):
         key_prefix: str = "pipecat:tts:cache:",
         max_connections: int = 10,
         socket_timeout: float = 5.0,
+        refresh_ttl_on_hit: bool = True,
+        default_ttl: Optional[int] = 86400,
         **redis_kwargs,
     ):
         """Initialize Redis cache backend.
@@ -41,6 +43,10 @@ class RedisCacheBackend(CacheBackend):
             key_prefix: Prefix for all cache keys.
             max_connections: Maximum number of Redis connections.
             socket_timeout: Socket timeout in seconds.
+            refresh_ttl_on_hit: When True, each cache hit resets the key's TTL
+                to default_ttl so frequently accessed phrases stay cached.
+            default_ttl: The full TTL (seconds) to re-apply on cache hits.
+                Should match the cache_ttl passed to TTSCacheMixin.
             **redis_kwargs: Additional Redis client arguments.
         """
         if not REDIS_AVAILABLE:
@@ -53,6 +59,8 @@ class RedisCacheBackend(CacheBackend):
         self._key_prefix = key_prefix
         self._max_connections = max_connections
         self._socket_timeout = socket_timeout
+        self._refresh_ttl_on_hit = refresh_ttl_on_hit
+        self._default_ttl = default_ttl
         self._redis_kwargs = redis_kwargs
         self._client: Optional["aioredis.Redis"] = None
         logger.debug(f"Initialized RedisCacheBackend: prefix={key_prefix}")
@@ -79,10 +87,15 @@ class RedisCacheBackend(CacheBackend):
         return f"{self._key_prefix}{key}"
 
     async def get(self, key: str) -> Optional[CachedTTSResponse]:
-        """Retrieve cached response, or None if not found/expired."""
+        """Retrieve cached response, or None if not found/expired.
+
+        When refresh_ttl_on_hit is enabled, a successful get resets the
+        key's Redis TTL so frequently used phrases stay cached.
+        """
         try:
             client = await self._get_client()
-            data = await client.get(self._make_key(key))
+            prefixed_key = self._make_key(key)
+            data = await client.get(prefixed_key)
 
             if data is None:
                 return None
@@ -91,6 +104,11 @@ class RedisCacheBackend(CacheBackend):
             if not isinstance(response, CachedTTSResponse):
                 logger.error(f"Invalid cached data type: {type(response)}")
                 return None
+
+            # Refresh TTL: re-apply the full original TTL on hit
+            if self._refresh_ttl_on_hit and self._default_ttl and self._default_ttl > 0:
+                await client.expire(prefixed_key, self._default_ttl)
+
             return response
 
         except aioredis.ConnectionError as e:
