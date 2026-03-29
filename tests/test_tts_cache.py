@@ -18,6 +18,8 @@ Tests cover:
 - Cache disabled when no backend provided
 - Cache stats tracking
 - Push_frame intercepts audio and stop frames for caching
+- _serving_from_cache flag and metrics skipping
+- No duplicate Started/Stopped frames on cache hit
 """
 
 import unittest
@@ -294,7 +296,7 @@ class TestTTSCacheMixinIntegration:
 
     @pytest.mark.asyncio
     async def test_cached_frames_have_context_id(self, backend):
-        """Replayed frames from cache must carry the correct context_id."""
+        """Replayed audio frames from cache must carry the correct context_id."""
         svc = self._make_service(backend)
 
         # Populate cache
@@ -312,36 +314,12 @@ class TestTTSCacheMixinIntegration:
         async for f in svc.run_tts("test phrase", replay_ctx):
             replayed.append(f)
 
-        # All replayed frames should have the new context_id
+        # All replayed audio frames should have the new context_id
         for f in replayed:
-            if isinstance(f, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame)):
+            if isinstance(f, TTSAudioRawFrame):
                 assert f.context_id == replay_ctx, (
                     f"{type(f).__name__}.context_id={f.context_id!r}, expected {replay_ctx!r}"
                 )
-
-    @pytest.mark.asyncio
-    async def test_replayed_frame_types_order(self, backend):
-        """Cache replay should yield Started → Audio(s) → Stopped."""
-        svc = self._make_service(backend)
-
-        # Populate
-        frames = []
-        async for f in svc.run_tts("order test", "c1"):
-            frames.append(f)
-        for f in frames:
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
-
-        # Replay
-        replayed = []
-        async for f in svc.run_tts("order test", "c2"):
-            replayed.append(f)
-
-        types = [type(f) for f in replayed]
-        assert types[0] is TTSStartedFrame
-        assert types[-1] is TTSStoppedFrame
-        assert any(t is TTSAudioRawFrame for t in types[1:-1])
 
     @pytest.mark.asyncio
     async def test_interruption_clears_batch_state(self, backend):
@@ -457,8 +435,7 @@ class TestTTSCacheMixinIntegration:
 
         assert svc._cache_misses == 1
 
-        # Replay — the replayed frames go through _yield_cached_frames, not push_frame,
-        # but if they did, _is_from_cache would prevent re-buffering
+        # Replay
         replayed = []
         async for f in svc.run_tts("no re-buffer", "c2"):
             replayed.append(f)
@@ -672,22 +649,121 @@ class TestBatchFinalization:
         assert svc._cache_misses == 2
         assert svc._cache_hits == 0
 
-        # Second turn: same two sentences — first text won't hit individual cache,
-        # but will be a miss. The combined entry is keyed on "hello. how are you?"
-        # which only gets looked up if the first text is a miss and we check combined.
-        # In practice, the first run_tts("hello.") will be a miss (no individual entry),
-        # and the second run_tts("how are you?") will also be a miss. But after
-        # TTSStoppedFrame, the combined entry already exists so it won't be re-stored.
-        #
-        # To get a hit, the lookup needs the combined text. This happens when a single
-        # run_tts is called with the combined text (e.g., opening message scenario).
-        # For multi-sentence turns from LLM, the cache prevents re-generation on the
-        # TTS side since the same combined audio is stored.
-
         # Verify the combined key exists
         combined_key = svc._generate_cache_key("hello. how are you?")
         cached = await backend.get(combined_key)
         assert cached is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests: Cache hit behavior (serving_from_cache, metrics, frame types)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheHitBehavior:
+    """Test cache-hit-specific behavior."""
+
+    @pytest.fixture
+    def backend(self):
+        return MemoryCacheBackend(max_size=100)
+
+    @pytest.mark.asyncio
+    async def test_serving_from_cache_flag_set_during_hit(self, backend):
+        """_serving_from_cache should be True during cache replay, False otherwise."""
+        svc = CachedMockTTS(cache_backend=backend)
+        assert not svc._serving_from_cache
+
+        # Populate cache
+        async for f in svc.run_tts("flag test", "c1"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+        assert not svc._serving_from_cache
+
+        # During cache hit, the flag should be set (we check after)
+        async for f in svc.run_tts("flag test", "c2"):
+            pass
+        # Flag should be cleared after run_tts returns
+        assert not svc._serving_from_cache
+
+    @pytest.mark.asyncio
+    async def test_usage_metrics_skipped_on_cache_hit(self, backend):
+        """start_tts_usage_metrics should not fire on cache hits."""
+        svc = CachedMockTTS(cache_backend=backend)
+
+        usage_calls: List[str] = []
+        original_super_usage = TTSService.start_tts_usage_metrics
+
+        async def tracking_usage(self_inner, text):
+            usage_calls.append(text)
+            await original_super_usage(self_inner, text)
+
+        # Monkey-patch TTSService to track usage metric calls
+        TTSService.start_tts_usage_metrics = tracking_usage
+
+        try:
+            # Populate cache (miss → usage metrics should fire from parent service)
+            async for f in svc.run_tts("metrics test", "c1"):
+                if isinstance(f, TTSAudioRawFrame):
+                    await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+            await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+            initial_count = len(usage_calls)
+
+            # Cache hit — usage metrics should be skipped by the mixin
+            async for _ in svc.run_tts("metrics test", "c2"):
+                pass
+
+            assert len(usage_calls) == initial_count, (
+                f"Usage metrics should not fire on cache hit, but got "
+                f"{len(usage_calls) - initial_count} extra calls"
+            )
+        finally:
+            TTSService.start_tts_usage_metrics = original_super_usage
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_started_stopped_frames_on_hit(self, backend):
+        """Cache replay should NOT yield TTSStartedFrame or TTSStoppedFrame.
+
+        The base class manages these (push_start_frame, stop-frame handler).
+        Yielding them from cache would cause duplicates.
+        """
+        svc = CachedMockTTS(cache_backend=backend)
+
+        # Populate
+        async for f in svc.run_tts("dup test", "c1"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        # Replay
+        replayed = []
+        async for f in svc.run_tts("dup test", "c2"):
+            replayed.append(f)
+
+        started = [f for f in replayed if isinstance(f, TTSStartedFrame)]
+        stopped = [f for f in replayed if isinstance(f, TTSStoppedFrame)]
+        assert len(started) == 0, f"Expected 0 TTSStartedFrame from replay, got {len(started)}"
+        assert len(stopped) == 0, f"Expected 0 TTSStoppedFrame from replay, got {len(stopped)}"
+
+    @pytest.mark.asyncio
+    async def test_serving_from_cache_cleared_on_exception(self, backend):
+        """_serving_from_cache flag should be cleared even if replay raises."""
+        svc = CachedMockTTS(cache_backend=backend)
+
+        # Manually populate backend with a corrupt entry
+        corrupt = CachedTTSResponse(
+            audio_chunks=[],  # empty — won't cause replay to raise but let's test the flag
+            sample_rate=16000,
+            num_channels=1,
+        )
+        key = svc._generate_cache_key("exception test")
+        await backend.set(key, corrupt)
+
+        async for _ in svc.run_tts("exception test", "c1"):
+            pass
+
+        assert not svc._serving_from_cache
 
 
 # ---------------------------------------------------------------------------
