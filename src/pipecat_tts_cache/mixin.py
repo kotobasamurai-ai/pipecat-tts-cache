@@ -10,8 +10,6 @@ Updated for compatibility with pipecat-ai >= 0.0.104 (context_id-aware API).
 """
 
 import inspect
-import re
-from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -29,23 +27,20 @@ from .key_generator import generate_cache_key
 from .models import CachedAudioChunk, CachedTTSResponse, CachedWordTimestamp
 
 _CACHE_ORIGIN_KEY = "_tts_cache_origin"
-_WORD_SPLIT_RE = re.compile(r"[^\w\s']")
 _BYTES_PER_PCM_SAMPLE = 2
-
-
-@dataclass
-class BatchCacheTask:
-    """Pending cache task for one text in a batch."""
-
-    text: str
-    cache_key: str
-    word_count: int
 
 
 class TTSCacheMixin:
     """Mixin that adds caching to any TTSService subclass.
 
     Usage: class CachedTTS(TTSCacheMixin, SomeTTSService): pass
+
+    Caching strategy:
+    - Single sentence: cached under that sentence's text key.
+    - Multiple sentences in one turn (batched by the pipeline before
+      TTSStoppedFrame): cached under the combined text key. This handles
+      WebSocket TTS services where audio for all sentences arrives as one
+      continuous stream that cannot be split per sentence.
     """
 
     def __init__(
@@ -73,7 +68,7 @@ class TTSCacheMixin:
 
         self._cache_hits = 0
         self._cache_misses = 0
-        self._batch_cache_tasks: List[BatchCacheTask] = []
+        self._batch_texts: List[str] = []
         self._batch_audio_buffer: List[CachedAudioChunk] = []
         self._batch_word_timestamps: List[Tuple[str, float]] = []
 
@@ -92,12 +87,6 @@ class TTSCacheMixin:
                 f"TTS caching enabled: backend={type(cache_backend).__name__}, "
                 f"ttl={cache_ttl}s, namespace={cache_namespace or 'default'}, "
             )
-
-            if not hasattr(self, "start_word_timestamps"):
-                logger.debug(
-                    "TTS service does not support word timestamps. Only single-sentence "
-                    "responses will be cached."
-                )
         else:
             logger.debug("TTS caching disabled: no backend provided")
 
@@ -127,11 +116,6 @@ class TTSCacheMixin:
             namespace=self._cache_namespace,
         )
 
-    def _parse_words_from_text(self, text: str) -> List[str]:
-        """Parse words from text to match TTS word segmentation."""
-        cleaned = _WORD_SPLIT_RE.sub("", text)
-        return [w for w in cleaned.split() if w]
-
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Run TTS with caching support.
 
@@ -144,6 +128,7 @@ class TTSCacheMixin:
                 yield frame
             return
 
+        # Check cache for this individual text first
         cache_key = self._generate_cache_key(text)
         cached_response = await self._safe_cache_get(cache_key)
 
@@ -159,12 +144,7 @@ class TTSCacheMixin:
         self._cache_misses += 1
         logger.debug(f"Cache miss: '{text[:50]}...'")
 
-        task = BatchCacheTask(
-            text=text,
-            cache_key=cache_key,
-            word_count=len(self._parse_words_from_text(text)),
-        )
-        self._batch_cache_tasks.append(task)
+        self._batch_texts.append(text)
 
         try:
             async for frame in super().run_tts(text, context_id):
@@ -227,7 +207,7 @@ class TTSCacheMixin:
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Override push_frame to intercept audio frames for caching."""
-        if not self._is_from_cache(frame) and self._batch_cache_tasks:
+        if not self._is_from_cache(frame) and self._batch_texts:
             if isinstance(frame, TTSAudioRawFrame):
                 chunk = CachedAudioChunk(
                     audio=frame.audio,
@@ -238,7 +218,7 @@ class TTSCacheMixin:
                 self._batch_audio_buffer.append(chunk)
 
             elif isinstance(frame, TTSStoppedFrame):
-                await self._finalize_batch_cache_tasks()
+                await self._finalize_batch()
 
         await super().push_frame(frame, direction)
 
@@ -248,20 +228,20 @@ class TTSCacheMixin:
         """Intercept word timestamps for caching."""
         filtered_times = [(w, t) for w, t in word_times if w not in ("TTSStoppedFrame", "Reset")]
 
-        if self._batch_cache_tasks and filtered_times:
+        if self._batch_texts and filtered_times:
             self._batch_word_timestamps.extend(filtered_times)
 
         if self._has_parent_add_word_timestamps:
             await super().add_word_timestamps(word_times, context_id=context_id)
 
-    async def _finalize_batch_cache_tasks(self):
-        """Split batch audio by word boundaries and store each task."""
-        if not self._batch_cache_tasks:
+    async def _finalize_batch(self):
+        """Cache the collected audio for the current batch of texts."""
+        if not self._batch_texts:
             return
 
         if not self._batch_audio_buffer:
             logger.warning(
-                f"No audio collected for {len(self._batch_cache_tasks)} tasks, skipping cache"
+                f"No audio collected for {len(self._batch_texts)} text(s), skipping cache"
             )
             self._clear_batch_state()
             return
@@ -269,144 +249,65 @@ class TTSCacheMixin:
         all_audio = b"".join(chunk.audio for chunk in self._batch_audio_buffer)
         sample_rate = self._batch_audio_buffer[0].sample_rate
         num_channels = self._batch_audio_buffer[0].num_channels
-
-        if not self._batch_word_timestamps:
-            if len(self._batch_cache_tasks) == 1:
-                await self._finalize_single_task(
-                    self._batch_cache_tasks[0], all_audio, sample_rate, num_channels
-                )
-            else:
-                logger.warning(
-                    f"Cannot split audio for {len(self._batch_cache_tasks)} batched "
-                    "sentences without word timestamps. Only single-sentence responses "
-                    "can be cached with this TTS service."
-                )
-                self._clear_batch_state()
-            return
-
-        if len(self._batch_cache_tasks) == 1:
-            await self._finalize_single_task(
-                self._batch_cache_tasks[0], all_audio, sample_rate, num_channels
-            )
-            return
-
-        total_expected_words = sum(t.word_count for t in self._batch_cache_tasks)
-        actual_word_count = len(self._batch_word_timestamps)
-
-        if total_expected_words != actual_word_count:
-            logger.debug(
-                f"Word count mismatch for batch: expected {total_expected_words}, "
-                f"got {actual_word_count}. Cannot split reliably, skipping cache."
-            )
-            self._clear_batch_state()
-            return
-
-        bytes_per_sample = _BYTES_PER_PCM_SAMPLE * num_channels
-        total_duration = self._audio_duration(all_audio, sample_rate, num_channels)
-        current_word_idx = 0
-
-        for task in self._batch_cache_tasks:
-            task_timestamps = self._batch_word_timestamps[
-                current_word_idx : current_word_idx + task.word_count
-            ]
-
-            if not task_timestamps:
-                logger.warning(f"No timestamps for task '{task.text[:30]}...', skipping")
-                current_word_idx += task.word_count
-                continue
-
-            start_time = task_timestamps[0][1]
-            next_word_idx = current_word_idx + task.word_count
-            if next_word_idx < len(self._batch_word_timestamps):
-                end_time = self._batch_word_timestamps[next_word_idx][1]
-            else:
-                end_time = total_duration
-
-            start_byte = int(start_time * sample_rate * bytes_per_sample)
-            end_byte = int(end_time * sample_rate * bytes_per_sample)
-            start_byte = (start_byte // bytes_per_sample) * bytes_per_sample
-            end_byte = (end_byte // bytes_per_sample) * bytes_per_sample
-            start_byte = max(0, start_byte)
-            end_byte = min(len(all_audio), end_byte)
-
-            task_audio = all_audio[start_byte:end_byte]
-
-            if not task_audio:
-                logger.warning(f"Empty audio slice for '{task.text[:30]}...', skipping")
-                current_word_idx += task.word_count
-                continue
-
-            normalized_timestamps = [
-                CachedWordTimestamp(word=w, timestamp=t - start_time) for w, t in task_timestamps
-            ]
-
-            await self._store_response(
-                task=task,
-                audio=task_audio,
-                sample_rate=sample_rate,
-                num_channels=num_channels,
-                timestamps=normalized_timestamps,
-                duration=end_time - start_time,
-            )
-            current_word_idx += task.word_count
-
-        self._clear_batch_state()
-
-    async def _finalize_single_task(self, task, all_audio, sample_rate, num_channels):
-        """Cache a single task, with or without word timestamps."""
         duration = self._audio_duration(all_audio, sample_rate, num_channels)
+
         timestamps = [
             CachedWordTimestamp(word=w, timestamp=t) for w, t in self._batch_word_timestamps
         ]
-        await self._store_response(
-            task=task,
-            audio=all_audio,
-            sample_rate=sample_rate,
-            num_channels=num_channels,
-            timestamps=timestamps,
-            duration=duration,
-        )
+
+        # Determine cache key: single text uses its own key, multiple texts
+        # use a combined key so the same multi-sentence turn is a cache hit.
+        if len(self._batch_texts) == 1:
+            cache_text = self._batch_texts[0]
+        else:
+            cache_text = " ".join(self._batch_texts)
+            logger.debug(
+                f"Caching {len(self._batch_texts)} sentences as combined entry: "
+                f"'{cache_text[:80]}...'"
+            )
+
+        cache_key = self._generate_cache_key(cache_text)
+
+        try:
+            cached_response = CachedTTSResponse(
+                audio_chunks=[CachedAudioChunk(all_audio, sample_rate, num_channels)],
+                sample_rate=sample_rate,
+                num_channels=num_channels,
+                word_timestamps=timestamps,
+                total_duration_s=duration,
+                metadata={
+                    "text": cache_text,
+                    "audio_bytes": len(all_audio),
+                    "word_count": len(timestamps),
+                    "sentence_count": len(self._batch_texts),
+                },
+            )
+
+            success = await self._cache_backend.set(
+                cache_key, cached_response, ttl=self._cache_ttl
+            )
+            if success:
+                logger.debug(f"Cached: '{cache_text[:50]}...' ({len(all_audio)} bytes)")
+        except Exception as e:
+            logger.error(f"Error caching '{cache_text[:30]}...': {e}")
+
         self._clear_batch_state()
 
     @staticmethod
     def _audio_duration(audio: bytes, sample_rate: int, num_channels: int) -> float:
         return len(audio) / (sample_rate * _BYTES_PER_PCM_SAMPLE * num_channels)
 
-    async def _store_response(self, task, audio, sample_rate, num_channels, timestamps, duration):
-        """Shared helper to write to backend."""
-        try:
-            cached_response = CachedTTSResponse(
-                audio_chunks=[CachedAudioChunk(audio, sample_rate, num_channels)],
-                sample_rate=sample_rate,
-                num_channels=num_channels,
-                word_timestamps=timestamps,
-                total_duration_s=duration,
-                metadata={
-                    "text": task.text,
-                    "audio_bytes": len(audio),
-                    "word_count": len(timestamps),
-                },
-            )
-
-            success = await self._cache_backend.set(
-                task.cache_key, cached_response, ttl=self._cache_ttl
-            )
-            if success:
-                logger.debug(f"Cached: '{task.text[:50]}...' ({len(audio)} bytes)")
-        except Exception as e:
-            logger.error(f"Error caching '{task.text[:30]}...': {e}")
-
     def _clear_batch_state(self) -> None:
         """Clear all batch-related state."""
-        self._batch_cache_tasks.clear()
+        self._batch_texts.clear()
         self._batch_audio_buffer.clear()
         self._batch_word_timestamps.clear()
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruptions during TTS generation."""
-        if self._batch_cache_tasks:
+        if self._batch_texts:
             logger.debug(
-                f"Interruption - clearing {len(self._batch_cache_tasks)} pending cache tasks"
+                f"Interruption - clearing {len(self._batch_texts)} pending cache text(s)"
             )
             self._clear_batch_state()
 
