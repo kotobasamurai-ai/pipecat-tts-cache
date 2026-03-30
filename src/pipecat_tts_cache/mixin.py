@@ -10,12 +10,13 @@ Updated for compatibility with pipecat-ai >= 0.0.104 (context_id-aware API).
 
 Key integration points with the current pipecat TTS pipeline:
 
-    _synthesize_text (base class) orchestrates TTS:
+    _push_tts_frames (base class) orchestrates TTS:
       1. create_audio_context(context_id) + append TTSStartedFrame  [if push_start_frame]
       2. start_ttfb_metrics / start_processing_metrics
       3. tts_process_generator(run_tts(...))  <- mixin overrides run_tts
       4. stop_processing_metrics
-      5. TTSStoppedFrame is pushed by stop-frame handler or audio-context teardown
+      5. TTSSentenceBoundaryFrame appended to audio context (per sentence)
+      6. TTSStoppedFrame is pushed by stop-frame handler or audio-context teardown
 
     On cache hit the mixin must:
       - NOT yield TTSStartedFrame/TTSStoppedFrame (base already handles those)
@@ -25,11 +26,12 @@ Key integration points with the current pipecat TTS pipeline:
       - Flag the current request as a cache hit so metrics helpers can differentiate
 
 Caching strategy:
-    - Single sentence: cached under that sentence's text key.
-    - Multiple sentences in one turn (batched by the pipeline before
-      TTSStoppedFrame): cached under the combined text key. This handles
-      WebSocket TTS services where audio for all sentences arrives as one
-      continuous stream that cannot be split per sentence.
+    Per-sentence caching using TTSSentenceBoundaryFrame as the delimiter.
+    Each sentence is cached under its own text key. Silence frames
+    (metadata["_tts_silence"]) are excluded from cached audio.
+
+    Fallback: if no TTSSentenceBoundaryFrame arrives before TTSStoppedFrame
+    (e.g. older pipecat versions), all sentences are cached under a combined key.
 """
 
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -43,6 +45,11 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+
+try:
+    from pipecat.frames.frames import TTSSentenceBoundaryFrame
+except ImportError:
+    TTSSentenceBoundaryFrame = None
 
 from .backends.base import CacheBackend
 from .key_generator import generate_cache_key
@@ -83,9 +90,11 @@ class TTSCacheMixin:
 
         self._cache_hits = 0
         self._cache_misses = 0
-        self._batch_texts: List[str] = []
-        self._batch_audio_buffer: List[CachedAudioChunk] = []
-        self._batch_word_timestamps: List[Tuple[str, float]] = []
+        # Per-sentence caching state: texts queued by run_tts (FIFO),
+        # audio buffer for the current sentence, word timestamps.
+        self._pending_texts: List[str] = []
+        self._current_audio_buffer: List[CachedAudioChunk] = []
+        self._current_word_timestamps: List[Tuple[str, float]] = []
         # Track whether the current run_tts call is serving from cache so that
         # metric methods and push_frame can behave appropriately.
         self._serving_from_cache = False
@@ -170,7 +179,7 @@ class TTSCacheMixin:
         self._cache_misses += 1
         logger.debug(f"Cache miss: '{text[:50]}...'")
 
-        self._batch_texts.append(text)
+        self._pending_texts.append(text)
 
         try:
             async for frame in super().run_tts(text, context_id):
@@ -228,18 +237,30 @@ class TTSCacheMixin:
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Override push_frame to intercept audio frames for caching."""
-        if not self._is_from_cache(frame) and self._batch_texts:
+        if not self._is_from_cache(frame) and self._pending_texts:
+            # TTSSentenceBoundaryFrame: finalize the current sentence's audio
+            if TTSSentenceBoundaryFrame is not None and isinstance(
+                frame, TTSSentenceBoundaryFrame
+            ):
+                await self._cache_current_sentence()
+                # Don't pass boundary frames downstream
+                return
+
             if isinstance(frame, TTSAudioRawFrame):
-                chunk = CachedAudioChunk(
-                    audio=frame.audio,
-                    sample_rate=frame.sample_rate,
-                    num_channels=frame.num_channels,
-                    pts=getattr(frame, "pts", None),
-                )
-                self._batch_audio_buffer.append(chunk)
+                # Skip silence frames (inter-sentence silence inserted by pipecat)
+                if not frame.metadata.get("_tts_silence"):
+                    chunk = CachedAudioChunk(
+                        audio=frame.audio,
+                        sample_rate=frame.sample_rate,
+                        num_channels=frame.num_channels,
+                        pts=getattr(frame, "pts", None),
+                    )
+                    self._current_audio_buffer.append(chunk)
 
             elif isinstance(frame, TTSStoppedFrame):
-                await self._finalize_batch()
+                # Fallback: if any pending texts remain (no boundary frames arrived),
+                # cache them as a combined entry.
+                await self._finalize_remaining()
 
         await super().push_frame(frame, direction)
 
@@ -249,8 +270,8 @@ class TTSCacheMixin:
         """Intercept word timestamps for caching."""
         filtered_times = [(w, t) for w, t in word_times if w not in ("TTSStoppedFrame", "Reset")]
 
-        if self._batch_texts and filtered_times:
-            self._batch_word_timestamps.extend(filtered_times)
+        if self._pending_texts and filtered_times:
+            self._current_word_timestamps.extend(filtered_times)
 
         if hasattr(super(), "add_word_timestamps"):
             await super().add_word_timestamps(word_times, context_id=context_id)
@@ -259,37 +280,61 @@ class TTSCacheMixin:
     # Cache storage
     # ------------------------------------------------------------------
 
-    async def _finalize_batch(self):
-        """Cache the collected audio for the current batch of texts."""
-        if not self._batch_texts:
+    async def _cache_current_sentence(self):
+        """Cache the audio buffer for the current (first pending) sentence."""
+        if not self._pending_texts:
             return
 
-        if not self._batch_audio_buffer:
+        text = self._pending_texts.pop(0)
+
+        if not self._current_audio_buffer:
+            logger.warning(f"No audio collected for '{text[:50]}...', skipping cache")
+            self._current_word_timestamps.clear()
+            return
+
+        await self._store_cache_entry(text)
+
+    async def _finalize_remaining(self):
+        """Cache any remaining pending texts on TTSStoppedFrame.
+
+        If TTSSentenceBoundaryFrame already handled all sentences, there is
+        nothing left to do.  Otherwise (older pipecat without boundary frames),
+        fall back to combined-key caching.
+        """
+        if not self._pending_texts:
+            self._current_audio_buffer.clear()
+            self._current_word_timestamps.clear()
+            return
+
+        if not self._current_audio_buffer:
             logger.warning(
-                f"No audio collected for {len(self._batch_texts)} text(s), skipping cache"
+                f"No audio collected for {len(self._pending_texts)} text(s), skipping cache"
             )
             self._clear_batch_state()
             return
 
-        all_audio = b"".join(chunk.audio for chunk in self._batch_audio_buffer)
-        sample_rate = self._batch_audio_buffer[0].sample_rate
-        num_channels = self._batch_audio_buffer[0].num_channels
+        if len(self._pending_texts) == 1:
+            cache_text = self._pending_texts[0]
+        else:
+            cache_text = " ".join(self._pending_texts)
+            logger.debug(
+                f"Caching {len(self._pending_texts)} sentences as combined entry "
+                f"(no boundary frames): '{cache_text[:80]}...'"
+            )
+
+        await self._store_cache_entry(cache_text)
+        self._pending_texts.clear()
+
+    async def _store_cache_entry(self, cache_text: str):
+        """Store collected audio buffer under the given text key."""
+        all_audio = b"".join(chunk.audio for chunk in self._current_audio_buffer)
+        sample_rate = self._current_audio_buffer[0].sample_rate
+        num_channels = self._current_audio_buffer[0].num_channels
         duration = self._audio_duration(all_audio, sample_rate, num_channels)
 
         timestamps = [
-            CachedWordTimestamp(word=w, timestamp=t) for w, t in self._batch_word_timestamps
+            CachedWordTimestamp(word=w, timestamp=t) for w, t in self._current_word_timestamps
         ]
-
-        # Determine cache key: single text uses its own key, multiple texts
-        # use a combined key so the same multi-sentence turn is a cache hit.
-        if len(self._batch_texts) == 1:
-            cache_text = self._batch_texts[0]
-        else:
-            cache_text = " ".join(self._batch_texts)
-            logger.debug(
-                f"Caching {len(self._batch_texts)} sentences as combined entry: "
-                f"'{cache_text[:80]}...'"
-            )
 
         cache_key = self._generate_cache_key(cache_text)
 
@@ -304,7 +349,6 @@ class TTSCacheMixin:
                     "text": cache_text,
                     "audio_bytes": len(all_audio),
                     "word_count": len(timestamps),
-                    "sentence_count": len(self._batch_texts),
                 },
             )
 
@@ -316,7 +360,8 @@ class TTSCacheMixin:
         except Exception as e:
             logger.error(f"Error caching '{cache_text[:30]}...': {e}")
 
-        self._clear_batch_state()
+        self._current_audio_buffer.clear()
+        self._current_word_timestamps.clear()
 
     @staticmethod
     def _audio_duration(audio: bytes, sample_rate: int, num_channels: int) -> float:
@@ -324,15 +369,15 @@ class TTSCacheMixin:
 
     def _clear_batch_state(self) -> None:
         """Clear all batch-related state."""
-        self._batch_texts.clear()
-        self._batch_audio_buffer.clear()
-        self._batch_word_timestamps.clear()
+        self._pending_texts.clear()
+        self._current_audio_buffer.clear()
+        self._current_word_timestamps.clear()
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruptions during TTS generation."""
-        if self._batch_texts:
+        if self._pending_texts:
             logger.debug(
-                f"Interruption - clearing {len(self._batch_texts)} pending cache text(s)"
+                f"Interruption - clearing {len(self._pending_texts)} pending cache text(s)"
             )
             self._clear_batch_state()
 

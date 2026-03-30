@@ -12,8 +12,9 @@ Tests cover:
 - Replayed frames carry context_id
 - Interruption clears batch state
 - Word timestamps forwarded with context_id
-- Single sentence caching
-- Multi-sentence combined caching (WebSocket TTS services)
+- Per-sentence caching via TTSSentenceBoundaryFrame
+- Fallback combined caching when no boundary frames
+- Silence frame exclusion from cache
 - Cache key generation uses _settings.voice / _settings.model
 - Cache disabled when no backend provided
 - Cache stats tracking
@@ -32,6 +33,7 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     TTSAudioRawFrame,
+    TTSSentenceBoundaryFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -329,14 +331,14 @@ class TestTTSCacheMixinIntegration:
         # Start a run_tts to create batch state
         async for _ in svc.run_tts("interrupted text", "ctx-int"):
             pass
-        assert len(svc._batch_texts) == 1
+        assert len(svc._pending_texts) == 1
 
         # Clear state (as _handle_interruption would)
         svc._clear_batch_state()
 
-        assert len(svc._batch_texts) == 0
-        assert len(svc._batch_audio_buffer) == 0
-        assert len(svc._batch_word_timestamps) == 0
+        assert len(svc._pending_texts) == 0
+        assert len(svc._current_audio_buffer) == 0
+        assert len(svc._current_word_timestamps) == 0
 
     @pytest.mark.asyncio
     async def test_cache_stats(self, backend):
@@ -441,8 +443,8 @@ class TestTTSCacheMixinIntegration:
             replayed.append(f)
 
         # No batch state should remain after replay
-        assert len(svc._batch_texts) == 0
-        assert len(svc._batch_audio_buffer) == 0
+        assert len(svc._pending_texts) == 0
+        assert len(svc._current_audio_buffer) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -512,13 +514,13 @@ class TestWordTimestampCaching:
         # Start a run_tts to create batch state
         async for _ in svc.run_tts("hello world", "ctx"):
             pass
-        assert len(svc._batch_texts) == 1
+        assert len(svc._pending_texts) == 1
 
         # Add word timestamps
         await svc.add_word_timestamps([("hello", 0.0), ("world", 0.5)], context_id="ctx")
-        assert len(svc._batch_word_timestamps) == 2
-        assert svc._batch_word_timestamps[0] == ("hello", 0.0)
-        assert svc._batch_word_timestamps[1] == ("world", 0.5)
+        assert len(svc._current_word_timestamps) == 2
+        assert svc._current_word_timestamps[0] == ("hello", 0.0)
+        assert svc._current_word_timestamps[1] == ("world", 0.5)
 
     @pytest.mark.asyncio
     async def test_sentinel_timestamps_filtered(self, backend):
@@ -526,18 +528,18 @@ class TestWordTimestampCaching:
         svc = CachedMockTTS(cache_backend=backend)
 
         # Create batch state manually
-        svc._batch_texts.append("hello")
-        svc._batch_audio_buffer.append(
+        svc._pending_texts.append("hello")
+        svc._current_audio_buffer.append(
             CachedAudioChunk(audio=_FAKE_AUDIO, sample_rate=16000, num_channels=1)
         )
 
         # Call add_word_timestamps with only real words (no sentinels)
         await svc.add_word_timestamps([("hello", 0.0)], context_id="ctx")
-        assert len(svc._batch_word_timestamps) == 1
-        assert svc._batch_word_timestamps[0][0] == "hello"
+        assert len(svc._current_word_timestamps) == 1
+        assert svc._current_word_timestamps[0][0] == "hello"
 
         # Verify sentinels would be filtered if present alongside real words
-        svc._batch_word_timestamps.clear()
+        svc._current_word_timestamps.clear()
         word_times = [("world", 0.1), ("TTSStoppedFrame", 0.0), ("Reset", 0.0)]
         filtered = [(w, t) for w, t in word_times if w not in ("TTSStoppedFrame", "Reset")]
         assert len(filtered) == 1
@@ -548,7 +550,7 @@ class TestWordTimestampCaching:
         """When no batch is active, timestamps should not be collected."""
         svc = CachedMockTTS(cache_backend=backend)
         await svc.add_word_timestamps([("hello", 0.0)], context_id="ctx")
-        assert len(svc._batch_word_timestamps) == 0
+        assert len(svc._current_word_timestamps) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +582,8 @@ class TestBatchFinalization:
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
         # Batch state should be cleared
-        assert len(svc._batch_texts) == 0
-        assert len(svc._batch_audio_buffer) == 0
+        assert len(svc._pending_texts) == 0
+        assert len(svc._current_audio_buffer) == 0
 
         # Backend should have the entry
         stats = await backend.get_stats()
@@ -592,21 +594,20 @@ class TestBatchFinalization:
         """If no audio was collected, finalization should skip caching."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        svc._batch_texts.append("empty")
+        svc._pending_texts.append("empty")
 
-        await svc._finalize_batch()
+        await svc._finalize_remaining()
 
-        assert len(svc._batch_texts) == 0
+        assert len(svc._pending_texts) == 0
         stats = await backend.get_stats()
         assert stats["size"] == 0
 
     @pytest.mark.asyncio
-    async def test_multiple_sentences_cached_as_combined(self, backend):
-        """Multiple run_tts calls before TTSStoppedFrame should be cached as combined text."""
+    async def test_per_sentence_caching_with_boundary_frames(self, backend):
+        """Each sentence should be cached individually when boundary frames are present."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        # Simulate two run_tts calls (as WebSocket TTS would do — both sent before
-        # any audio arrives)
+        # Simulate two run_tts calls
         frames1 = []
         async for f in svc.run_tts("first sentence.", "c1"):
             frames1.append(f)
@@ -614,42 +615,130 @@ class TestBatchFinalization:
         async for f in svc.run_tts("second sentence.", "c1"):
             frames2.append(f)
 
-        # Push all audio frames (from both sentences)
-        for f in frames1 + frames2:
+        # Push audio for first sentence, then boundary frame
+        for f in frames1:
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c1", text="first sentence."),
+            FrameDirection.DOWNSTREAM,
+        )
 
-        # TTSStoppedFrame triggers finalization
+        # Push audio for second sentence, then boundary frame
+        for f in frames2:
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c1", text="second sentence."),
+            FrameDirection.DOWNSTREAM,
+        )
+
+        # TTSStoppedFrame (nothing left to finalize)
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
-        # Should be cached as one combined entry
+        # Should have 2 separate cache entries
         stats = await backend.get_stats()
-        assert stats["size"] == 1
+        assert stats["size"] == 2
 
-        # The combined key should be retrievable
-        combined_key = svc._generate_cache_key("first sentence. second sentence.")
-        cached = await backend.get(combined_key)
-        assert cached is not None
-        assert cached.metadata["sentence_count"] == 2
+        # Each sentence should be retrievable individually
+        key1 = svc._generate_cache_key("first sentence.")
+        key2 = svc._generate_cache_key("second sentence.")
+        assert await backend.get(key1) is not None
+        assert await backend.get(key2) is not None
 
     @pytest.mark.asyncio
-    async def test_combined_cache_hit_on_second_turn(self, backend):
-        """Same multi-sentence turn should be a cache hit the second time."""
+    async def test_per_sentence_cache_hit(self, backend):
+        """Individual sentences should hit cache on second occurrence."""
         svc = CachedMockTTS(cache_backend=backend)
 
         # First turn: two sentences, cache miss
         async for f in svc.run_tts("hello.", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c1", text="hello."),
+            FrameDirection.DOWNSTREAM,
+        )
         async for f in svc.run_tts("how are you?", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c1", text="how are you?"),
+            FrameDirection.DOWNSTREAM,
+        )
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
         assert svc._cache_misses == 2
         assert svc._cache_hits == 0
 
-        # Verify the combined key exists
+        # Second turn: "hello." should hit, "goodbye." should miss
+        async for _ in svc.run_tts("hello.", "c2"):
+            pass
+        assert svc._cache_hits == 1
+
+        async for f in svc.run_tts("goodbye.", "c2"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c2", text="goodbye."),
+            FrameDirection.DOWNSTREAM,
+        )
+        await svc.push_frame(TTSStoppedFrame(context_id="c2"), FrameDirection.DOWNSTREAM)
+
+        assert svc._cache_hits == 1
+        assert svc._cache_misses == 3
+        assert len(svc.run_tts_calls) == 3  # parent called 3 times (not for "hello." hit)
+
+    @pytest.mark.asyncio
+    async def test_silence_frames_excluded_from_cache(self, backend):
+        """Silence frames with _tts_silence metadata should not be cached."""
+        svc = CachedMockTTS(cache_backend=backend)
+
+        async for f in svc.run_tts("with silence.", "c1"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+
+        # Push a silence frame (as pipecat would for inter-sentence silence)
+        silence = TTSAudioRawFrame(
+            audio=b"\x00" * 640,
+            sample_rate=_SAMPLE_RATE,
+            num_channels=1,
+        )
+        silence.metadata["_tts_silence"] = True
+        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
+
+        await svc.push_frame(
+            TTSSentenceBoundaryFrame(context_id="c1", text="with silence."),
+            FrameDirection.DOWNSTREAM,
+        )
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        # Verify cached audio does not contain silence
+        key = svc._generate_cache_key("with silence.")
+        cached = await backend.get(key)
+        assert cached is not None
+        assert cached.audio_chunks[0].audio == _FAKE_AUDIO  # only real audio
+
+    @pytest.mark.asyncio
+    async def test_fallback_combined_caching_without_boundary_frames(self, backend):
+        """Without boundary frames, sentences fall back to combined-key caching."""
+        svc = CachedMockTTS(cache_backend=backend)
+
+        # Two run_tts calls, no boundary frames
+        async for f in svc.run_tts("hello.", "c1"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        async for f in svc.run_tts("how are you?", "c1"):
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+
+        # Only TTSStoppedFrame (no boundary frames)
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        # Should be cached as one combined entry
+        stats = await backend.get_stats()
+        assert stats["size"] == 1
+
         combined_key = svc._generate_cache_key("hello. how are you?")
         cached = await backend.get(combined_key)
         assert cached is not None
@@ -818,7 +907,7 @@ class TestErrorHandling:
             async for _ in svc.run_tts("fail", "ctx"):
                 pass
 
-        assert len(svc._batch_texts) == 0
+        assert len(svc._pending_texts) == 0
 
     @pytest.mark.asyncio
     async def test_clear_cache_without_backend(self):
