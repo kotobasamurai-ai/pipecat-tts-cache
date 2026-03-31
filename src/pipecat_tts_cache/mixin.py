@@ -186,6 +186,17 @@ class TTSCacheMixin:
 
         # Check cache for this individual text first
         cache_key = self._generate_cache_key(text)
+        # Debug: log key generation inputs to diagnose cache key mismatch
+        _s = getattr(self, "_settings", None)
+        _dbg_voice = getattr(_s, "voice", "?") if _s else "?"
+        _dbg_model = getattr(_s, "model", "?") if _s else "?"
+        _dbg_given = _s.given_fields() if _s and hasattr(_s, "given_fields") else {}
+        _dbg_ns = getattr(self, "_cache_namespace", None)
+        logger.debug(
+            f"{_LOG_PREFIX} cache_key={cache_key[:16]}... text='{text[:40]}' "
+            f"voice={_dbg_voice} model={_dbg_model} sr={getattr(self, 'sample_rate', '?')} "
+            f"given={_dbg_given} ns={_dbg_ns}"
+        )
         cached_response = await self._safe_cache_get(cache_key)
 
         if cached_response:
