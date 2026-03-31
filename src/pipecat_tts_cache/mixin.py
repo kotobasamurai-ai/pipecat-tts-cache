@@ -57,6 +57,7 @@ from .models import CachedAudioChunk, CachedTTSResponse, CachedWordTimestamp
 
 _CACHE_ORIGIN_KEY = "_tts_cache_origin"
 _BYTES_PER_PCM_SAMPLE = 2
+_LOG_PREFIX = "[TTS_CACHE]"
 
 
 class TTSCacheMixin:
@@ -69,7 +70,7 @@ class TTSCacheMixin:
         self,
         *args,
         cache_backend: Optional[CacheBackend] = None,
-        cache_ttl: Optional[int] = 86400,
+        cache_ttl: Optional[int] = 5184000,
         cache_namespace: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -106,11 +107,11 @@ class TTSCacheMixin:
 
         if self._enable_cache:
             logger.info(
-                f"TTS caching enabled: backend={type(cache_backend).__name__}, "
-                f"ttl={cache_ttl}s, namespace={cache_namespace or 'default'}, "
+                f"{_LOG_PREFIX} Enabled: backend={type(cache_backend).__name__}, "
+                f"ttl={cache_ttl}s, namespace={cache_namespace or 'default'}"
             )
         else:
-            logger.debug("TTS caching disabled: no backend provided")
+            logger.debug(f"{_LOG_PREFIX} Disabled: no backend provided")
 
     def _generate_cache_key(self, text: str) -> str:
         """Generate cache key for the current TTS request."""
@@ -169,11 +170,16 @@ class TTSCacheMixin:
         if self._deferred_finalize:
             if self._current_audio_buffer and self._pending_texts:
                 deferred_text = self._pending_texts[0][:50]
+                audio_bytes = sum(len(c.audio) for c in self._current_audio_buffer)
                 await self._finalize_remaining()
-                logger.debug(f"Deferred cache saved: '{deferred_text}...'")
+                logger.info(
+                    f"{_LOG_PREFIX} DEFERRED STORE: '{deferred_text}...' "
+                    f"({audio_bytes} bytes arrived late)"
+                )
             elif self._pending_texts:
-                logger.debug(
-                    f"Deferred cache discarded (no audio): '{self._pending_texts[0][:50]}...'"
+                logger.warning(
+                    f"{_LOG_PREFIX} DEFERRED DISCARD: '{self._pending_texts[0][:50]}...' "
+                    f"(audio never arrived)"
                 )
                 self._clear_batch_state()
             self._deferred_finalize = False
@@ -185,8 +191,13 @@ class TTSCacheMixin:
         if cached_response:
             self._cache_hits += 1
             self._serving_from_cache = True
-            logger.debug(
-                f"Cache hit: '{text[:50]}...' ({len(cached_response.audio_chunks)} chunks)"
+            total = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / total * 100
+            audio_bytes = sum(len(c.audio) for c in cached_response.audio_chunks)
+            logger.info(
+                f"{_LOG_PREFIX} HIT: '{text[:50]}...' "
+                f"({audio_bytes} bytes, {cached_response.total_duration_s:.1f}s) "
+                f"[{self._cache_hits}/{total} = {hit_rate:.0f}%]"
             )
             try:
                 async for frame in self._yield_cached_frames(cached_response, context_id):
@@ -196,7 +207,12 @@ class TTSCacheMixin:
             return
 
         self._cache_misses += 1
-        logger.debug(f"Cache miss: '{text[:50]}...'")
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total * 100
+        logger.info(
+            f"{_LOG_PREFIX} MISS: '{text[:50]}...' "
+            f"[{self._cache_hits}/{total} = {hit_rate:.0f}%]"
+        )
 
         self._pending_texts.append(text)
 
@@ -204,7 +220,7 @@ class TTSCacheMixin:
             async for frame in super().run_tts(text, context_id):
                 yield frame
         except Exception as e:
-            logger.error(f"TTS generation failed: {e}")
+            logger.error(f"{_LOG_PREFIX} TTS generation failed: {e}")
             self._clear_batch_state()
             raise
 
@@ -213,7 +229,7 @@ class TTSCacheMixin:
         try:
             return await self._cache_backend.get(key)
         except Exception as e:
-            logger.warning(f"Cache get failed: {e}")
+            logger.warning(f"{_LOG_PREFIX} GET ERROR: {e}")
             return None
 
     async def _yield_cached_frames(
@@ -307,7 +323,7 @@ class TTSCacheMixin:
         text = self._pending_texts.pop(0)
 
         if not self._current_audio_buffer:
-            logger.warning(f"No audio collected for '{text[:50]}...', skipping cache")
+            logger.warning(f"{_LOG_PREFIX} SKIP (no audio): '{text[:50]}...'")
             self._current_word_timestamps.clear()
             return
 
@@ -329,16 +345,17 @@ class TTSCacheMixin:
             if not self._deferred_finalize:
                 # First time: defer — audio may arrive late (WebSocket TTS).
                 self._deferred_finalize = True
-                logger.debug(
-                    f"No audio yet for {len(self._pending_texts)} text(s), "
-                    f"deferring cache to next run_tts"
+                logger.info(
+                    f"{_LOG_PREFIX} DEFER: {len(self._pending_texts)} text(s) "
+                    f"(no audio yet, will retry next run_tts)"
                 )
                 return
             else:
                 # Second time: audio never arrived — discard.
                 self._deferred_finalize = False
                 logger.warning(
-                    f"No audio collected for {len(self._pending_texts)} text(s), skipping cache"
+                    f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
+                    f"(audio never arrived after defer)"
                 )
                 self._clear_batch_state()
                 return
@@ -347,8 +364,8 @@ class TTSCacheMixin:
             cache_text = self._pending_texts[0]
         else:
             cache_text = " ".join(self._pending_texts)
-            logger.debug(
-                f"Caching {len(self._pending_texts)} sentences as combined entry "
+            logger.info(
+                f"{_LOG_PREFIX} COMBINE: {len(self._pending_texts)} sentences "
                 f"(no boundary frames): '{cache_text[:80]}...'"
             )
 
@@ -386,9 +403,12 @@ class TTSCacheMixin:
                 cache_key, cached_response, ttl=self._cache_ttl
             )
             if success:
-                logger.debug(f"Cached: '{cache_text[:50]}...' ({len(all_audio)} bytes)")
+                logger.info(
+                    f"{_LOG_PREFIX} STORE: '{cache_text[:50]}...' "
+                    f"({len(all_audio)} bytes, {duration:.1f}s)"
+                )
         except Exception as e:
-            logger.error(f"Error caching '{cache_text[:30]}...': {e}")
+            logger.error(f"{_LOG_PREFIX} STORE ERROR: '{cache_text[:30]}...': {e}")
 
         self._current_audio_buffer.clear()
         self._current_word_timestamps.clear()
@@ -407,8 +427,8 @@ class TTSCacheMixin:
         """Handle interruptions during TTS generation."""
         self._deferred_finalize = False
         if self._pending_texts:
-            logger.debug(
-                f"Interruption - clearing {len(self._pending_texts)} pending cache text(s)"
+            logger.info(
+                f"{_LOG_PREFIX} INTERRUPT: clearing {len(self._pending_texts)} pending text(s)"
             )
             self._clear_batch_state()
 
@@ -433,7 +453,7 @@ class TTSCacheMixin:
                 backend_stats = await self._cache_backend.get_stats()
                 stats["backend"] = backend_stats
             except Exception as e:
-                logger.error(f"Error getting backend stats: {e}")
+                logger.error(f"{_LOG_PREFIX} Stats error: {e}")
                 stats["backend"] = {"error": str(e)}
 
         return stats
@@ -441,13 +461,13 @@ class TTSCacheMixin:
     async def clear_cache(self, namespace: Optional[str] = None) -> int:
         """Clear cache entries."""
         if not self._cache_backend:
-            logger.warning("Cannot clear cache: no backend configured")
+            logger.warning(f"{_LOG_PREFIX} Cannot clear: no backend configured")
             return 0
 
         try:
             cleared = await self._cache_backend.clear(namespace)
-            logger.info(f"Cleared {cleared} cache entries")
+            logger.info(f"{_LOG_PREFIX} Cleared {cleared} entries")
             return cleared
         except Exception as e:
-            logger.error(f"Error clearing cache: {e}")
+            logger.error(f"{_LOG_PREFIX} Clear error: {e}")
             return 0
