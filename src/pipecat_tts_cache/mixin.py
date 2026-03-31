@@ -20,10 +20,8 @@ Key integration points with the current pipecat TTS pipeline:
 
     On cache hit the mixin must:
       - NOT yield TTSStartedFrame/TTSStoppedFrame (base already handles those)
-      - Yield TTSAudioRawFrame(s) -- they flow through tts_process_generator ->
+      - Only yield TTSAudioRawFrame(s) -- they flow through tts_process_generator ->
         append_to_audio_context -> audio context queue -> push_frame
-      - Override on_turn_context_completed to prevent premature context closure
-        when MISS sentences are still waiting for WebSocket audio
       - Skip TTS usage metrics (no real API call)
       - Flag the current request as a cache hit so metrics helpers can differentiate
 
@@ -191,22 +189,33 @@ class TTSCacheMixin:
         cached_response = await self._safe_cache_get(cache_key)
 
         if cached_response:
-            self._cache_hits += 1
-            self._serving_from_cache = True
-            total = self._cache_hits + self._cache_misses
-            hit_rate = self._cache_hits / total * 100
-            audio_bytes = sum(len(c.audio) for c in cached_response.audio_chunks)
-            logger.info(
-                f"{_LOG_PREFIX} HIT: '{text[:50]}...' "
-                f"({audio_bytes} bytes, {cached_response.total_duration_s:.1f}s) "
-                f"[{self._cache_hits}/{total} = {hit_rate:.0f}%]"
-            )
-            try:
-                async for frame in self._yield_cached_frames(cached_response, context_id):
-                    yield frame
-            finally:
-                self._serving_from_cache = False
-            return
+            # If there are pending MISS sentences whose audio hasn't arrived yet,
+            # skip the cache and send to Fish Audio instead. This preserves playback
+            # order: Fish Audio returns audio in send order, so all sentences in the
+            # same turn play back sequentially. Using cached audio here would cause
+            # the HIT sentence to play before the earlier MISS sentence.
+            if self._pending_texts:
+                logger.info(
+                    f"{_LOG_PREFIX} HIT (skip, {len(self._pending_texts)} MISS pending): "
+                    f"'{text[:50]}...' — sending to TTS to preserve order"
+                )
+            else:
+                self._cache_hits += 1
+                self._serving_from_cache = True
+                total = self._cache_hits + self._cache_misses
+                hit_rate = self._cache_hits / total * 100
+                audio_bytes = sum(len(c.audio) for c in cached_response.audio_chunks)
+                logger.info(
+                    f"{_LOG_PREFIX} HIT: '{text[:50]}...' "
+                    f"({audio_bytes} bytes, {cached_response.total_duration_s:.1f}s) "
+                    f"[{self._cache_hits}/{total} = {hit_rate:.0f}%]"
+                )
+                try:
+                    async for frame in self._yield_cached_frames(cached_response, context_id):
+                        yield frame
+                finally:
+                    self._serving_from_cache = False
+                return
 
         self._cache_misses += 1
         total = self._cache_hits + self._cache_misses
@@ -280,6 +289,8 @@ class TTSCacheMixin:
                 frame, TTSSentenceBoundaryFrame
             ):
                 await self._cache_current_sentence()
+                # Don't pass boundary frames downstream
+                return
 
             if isinstance(frame, TTSAudioRawFrame):
                 # Skip silence frames (inter-sentence silence inserted by pipecat)
@@ -298,21 +309,6 @@ class TTSCacheMixin:
                 await self._finalize_remaining()
 
         await super().push_frame(frame, direction)
-
-    async def on_turn_context_completed(self):
-        """Defer HTTP-style context closure while MISS sentences await WebSocket audio.
-
-        Clears _is_yielding_frames_synchronously so the base class treats this
-        as a WebSocket turn (flush only, no TTSStoppedFrame / remove_audio_context).
-        See TTSService.on_turn_context_completed (tts_service.py ~L654).
-        """
-        if self._pending_texts:
-            logger.info(
-                f"{_LOG_PREFIX} DEFER context close: "
-                f"{len(self._pending_texts)} MISS sentence(s) still awaiting audio"
-            )
-            self._is_yielding_frames_synchronously = False
-        await super().on_turn_context_completed()
 
     async def add_word_timestamps(
         self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
