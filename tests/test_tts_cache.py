@@ -611,14 +611,20 @@ class TestBatchFinalization:
         assert stats["size"] == 1
 
     @pytest.mark.asyncio
-    async def test_no_audio_skips_cache(self, backend):
-        """If no audio was collected, finalization should skip caching."""
+    async def test_no_audio_defers_then_skips_cache(self, backend):
+        """If no audio was collected, first finalize defers, second discards."""
         svc = CachedMockTTS(cache_backend=backend)
 
         svc._batch_texts.append("empty")
 
+        # First call: defers (texts kept, flag set)
         await svc._finalize_batch()
+        assert svc._deferred_finalize is True
+        assert len(svc._batch_texts) == 1
 
+        # Second call: discards (texts cleared, flag reset)
+        await svc._finalize_batch()
+        assert svc._deferred_finalize is False
         assert len(svc._batch_texts) == 0
         stats = await backend.get_stats()
         assert stats["size"] == 0
