@@ -20,8 +20,10 @@ Key integration points with the current pipecat TTS pipeline:
 
     On cache hit the mixin must:
       - NOT yield TTSStartedFrame/TTSStoppedFrame (base already handles those)
-      - Only yield TTSAudioRawFrame(s) -- they flow through tts_process_generator ->
+      - Yield TTSAudioRawFrame(s) -- they flow through tts_process_generator ->
         append_to_audio_context -> audio context queue -> push_frame
+      - Override on_turn_context_completed to prevent premature context closure
+        when MISS sentences are still waiting for WebSocket audio
       - Skip TTS usage metrics (no real API call)
       - Flag the current request as a cache hit so metrics helpers can differentiate
 
@@ -278,8 +280,6 @@ class TTSCacheMixin:
                 frame, TTSSentenceBoundaryFrame
             ):
                 await self._cache_current_sentence()
-                # Don't pass boundary frames downstream
-                return
 
             if isinstance(frame, TTSAudioRawFrame):
                 # Skip silence frames (inter-sentence silence inserted by pipecat)
@@ -298,6 +298,21 @@ class TTSCacheMixin:
                 await self._finalize_remaining()
 
         await super().push_frame(frame, direction)
+
+    async def on_turn_context_completed(self):
+        """Defer HTTP-style context closure while MISS sentences await WebSocket audio.
+
+        Clears _is_yielding_frames_synchronously so the base class treats this
+        as a WebSocket turn (flush only, no TTSStoppedFrame / remove_audio_context).
+        See TTSService.on_turn_context_completed (tts_service.py ~L654).
+        """
+        if self._pending_texts:
+            logger.info(
+                f"{_LOG_PREFIX} DEFER context close: "
+                f"{len(self._pending_texts)} MISS sentence(s) still awaiting audio"
+            )
+            self._is_yielding_frames_synchronously = False
+        await super().on_turn_context_completed()
 
     async def add_word_timestamps(
         self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
