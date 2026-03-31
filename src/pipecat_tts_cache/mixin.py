@@ -98,6 +98,11 @@ class TTSCacheMixin:
         # Track whether the current run_tts call is serving from cache so that
         # metric methods and push_frame can behave appropriately.
         self._serving_from_cache = False
+        # Deferred finalize: when a TTSStoppedFrame arrives before audio
+        # (e.g. WebSocket TTS with slow TTFB exceeding stop_frame_timeout),
+        # keep _pending_texts alive for one cycle so late-arriving audio can
+        # still be cached. Resolved at the start of the next run_tts call.
+        self._deferred_finalize = False
 
         if self._enable_cache:
             logger.info(
@@ -158,6 +163,20 @@ class TTSCacheMixin:
             async for frame in super().run_tts(text, context_id):
                 yield frame
             return
+
+        # Resolve any deferred cache from a previous run_tts whose audio
+        # arrived after TTSStoppedFrame (WebSocket TTS with slow TTFB).
+        if self._deferred_finalize:
+            if self._current_audio_buffer and self._pending_texts:
+                deferred_text = self._pending_texts[0][:50]
+                await self._finalize_remaining()
+                logger.debug(f"Deferred cache saved: '{deferred_text}...'")
+            elif self._pending_texts:
+                logger.debug(
+                    f"Deferred cache discarded (no audio): '{self._pending_texts[0][:50]}...'"
+                )
+                self._clear_batch_state()
+            self._deferred_finalize = False
 
         # Check cache for this individual text first
         cache_key = self._generate_cache_key(text)
@@ -307,11 +326,22 @@ class TTSCacheMixin:
             return
 
         if not self._current_audio_buffer:
-            logger.warning(
-                f"No audio collected for {len(self._pending_texts)} text(s), skipping cache"
-            )
-            self._clear_batch_state()
-            return
+            if not self._deferred_finalize:
+                # First time: defer — audio may arrive late (WebSocket TTS).
+                self._deferred_finalize = True
+                logger.debug(
+                    f"No audio yet for {len(self._pending_texts)} text(s), "
+                    f"deferring cache to next run_tts"
+                )
+                return
+            else:
+                # Second time: audio never arrived — discard.
+                self._deferred_finalize = False
+                logger.warning(
+                    f"No audio collected for {len(self._pending_texts)} text(s), skipping cache"
+                )
+                self._clear_batch_state()
+                return
 
         if len(self._pending_texts) == 1:
             cache_text = self._pending_texts[0]
@@ -375,6 +405,7 @@ class TTSCacheMixin:
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruptions during TTS generation."""
+        self._deferred_finalize = False
         if self._pending_texts:
             logger.debug(
                 f"Interruption - clearing {len(self._pending_texts)} pending cache text(s)"
