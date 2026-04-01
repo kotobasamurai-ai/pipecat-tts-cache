@@ -184,12 +184,14 @@ class TTSCacheMixin:
                 if self._pending_texts:
                     if self._current_audio_buffer:
                         await self._store_first_pending()
-                    else:
-                        # No audio arrived — discard pending text
-                        discarded = self._pending_texts.pop(0)
+                    # Discard any remaining pending texts (no audio to attribute)
+                    if self._pending_texts:
                         logger.warning(
-                            f"{_LOG_PREFIX} SKIP (no audio): '{discarded[:50]}'"
+                            f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
+                            f"on stop (no delimiter): "
+                            f"{[t[:30] for t in self._pending_texts]}"
                         )
+                        self._clear_state()
 
         await super().push_frame(frame, direction)
 
