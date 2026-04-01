@@ -192,6 +192,8 @@ class TTSCacheMixin:
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Override push_frame to intercept audio frames for caching."""
+        should_finalize = False
+
         if not self._is_from_cache(frame) and self._batch_cache_tasks:
             if isinstance(frame, TTSAudioRawFrame):
                 chunk = CachedAudioChunk(
@@ -203,9 +205,17 @@ class TTSCacheMixin:
                 self._batch_audio_buffer.append(chunk)
 
             elif isinstance(frame, TTSStoppedFrame):
-                await self._finalize_batch_cache_tasks()
+                should_finalize = True
 
+        # Let the base class handle the frame first. For TTSStoppedFrame, the
+        # base TTSService.push_frame may re-entrantly push a silence
+        # TTSAudioRawFrame (when push_silence_after_stop is enabled). By
+        # deferring finalization until after super().push_frame(), the silence
+        # frame is captured in _batch_audio_buffer before we write to cache.
         await super().push_frame(frame, direction)
+
+        if should_finalize:
+            await self._finalize_batch_cache_tasks()
 
     async def add_word_timestamps(self, word_times: List[Tuple[str, float]]):
         """Intercept word timestamps for caching."""
