@@ -245,12 +245,12 @@ class TestTTSCacheMixinIntegration:
     async def test_cache_disabled_without_backend(self):
         """When no backend is provided, caching is disabled."""
         svc = CachedMockTTS(cache_backend=None)
-        assert not svc._enable_cache
+        assert svc._cache_backend is None
 
     @pytest.mark.asyncio
     async def test_cache_enabled_with_backend(self, backend):
         svc = self._make_service(backend)
-        assert svc._enable_cache
+        assert svc._cache_backend is not None
 
     @pytest.mark.asyncio
     async def test_run_tts_passes_context_id_to_parent(self, backend):
@@ -334,7 +334,7 @@ class TestTTSCacheMixinIntegration:
         assert len(svc._pending_texts) == 1
 
         # Clear state (as _handle_interruption would)
-        svc._clear_batch_state()
+        svc._clear_state()
 
         assert len(svc._pending_texts) == 0
         assert len(svc._current_audio_buffer) == 0
@@ -590,30 +590,26 @@ class TestBatchFinalization:
         assert stats["size"] == 1
 
     @pytest.mark.asyncio
-    async def test_no_audio_defers_then_skips_cache(self, backend):
-        """If no audio was collected, first finalize defers, second discards."""
+    async def test_no_audio_skips_cache(self, backend):
+        """If no audio was collected, TTSStoppedFrame should not cache."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        svc._pending_texts.append("empty")
+        # run_tts without pushing any audio frames
+        async for _ in svc.run_tts("empty", "c1"):
+            pass
+        # Only push stop frame (no audio arrived)
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
-        # First call: defers (texts kept, flag set)
-        await svc._finalize_remaining()
-        assert svc._deferred_finalize is True
-        assert len(svc._pending_texts) == 1
-
-        # Second call: discards (texts cleared, flag reset)
-        await svc._finalize_remaining()
-        assert svc._deferred_finalize is False
         assert len(svc._pending_texts) == 0
         stats = await backend.get_stats()
         assert stats["size"] == 0
 
     @pytest.mark.asyncio
-    async def test_per_sentence_caching_with_boundary_frames(self, backend):
-        """Each sentence should be cached individually when boundary frames are present."""
+    async def test_per_sentence_caching_with_silence_delimiter(self, backend):
+        """Each sentence should be cached individually when silence frames delimit them."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        # Simulate two run_tts calls
+        # Two run_tts calls (Fish Audio WebSocket: both return immediately)
         frames1 = []
         async for f in svc.run_tts("first sentence.", "c1"):
             frames1.append(f)
@@ -621,32 +617,30 @@ class TestBatchFinalization:
         async for f in svc.run_tts("second sentence.", "c1"):
             frames2.append(f)
 
-        # Push audio for first sentence, then boundary frame
+        # Audio for first sentence arrives
         for f in frames1:
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c1", text="first sentence."),
-            FrameDirection.DOWNSTREAM,
-        )
 
-        # Push audio for second sentence, then boundary frame
+        # Silence frame = end of first sentence
+        silence = TTSAudioRawFrame(
+            audio=b"\x00" * 640, sample_rate=_SAMPLE_RATE, num_channels=1,
+        )
+        silence.metadata["_tts_silence"] = True
+        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
+
+        # Audio for second sentence arrives
         for f in frames2:
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c1", text="second sentence."),
-            FrameDirection.DOWNSTREAM,
-        )
 
-        # TTSStoppedFrame (nothing left to finalize)
+        # TTSStoppedFrame = end of last sentence
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
         # Should have 2 separate cache entries
         stats = await backend.get_stats()
         assert stats["size"] == 2
 
-        # Each sentence should be retrievable individually
         key1 = svc._generate_cache_key("first sentence.")
         key2 = svc._generate_cache_key("second sentence.")
         assert await backend.get(key1) is not None
@@ -657,27 +651,27 @@ class TestBatchFinalization:
         """Individual sentences should hit cache on second occurrence."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        # First turn: two sentences, cache miss
+        # First turn: two sentences, both miss
         async for f in svc.run_tts("hello.", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c1", text="hello."),
-            FrameDirection.DOWNSTREAM,
+
+        # Silence delimiter between sentences
+        silence = TTSAudioRawFrame(
+            audio=b"\x00" * 640, sample_rate=_SAMPLE_RATE, num_channels=1,
         )
+        silence.metadata["_tts_silence"] = True
+        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
+
         async for f in svc.run_tts("how are you?", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c1", text="how are you?"),
-            FrameDirection.DOWNSTREAM,
-        )
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
         assert svc._cache_misses == 2
         assert svc._cache_hits == 0
 
-        # Second turn: "hello." should hit, "goodbye." should miss
+        # Second turn: "hello." should hit (no pending), "goodbye." should miss
         async for _ in svc.run_tts("hello.", "c2"):
             pass
         assert svc._cache_hits == 1
@@ -685,69 +679,54 @@ class TestBatchFinalization:
         async for f in svc.run_tts("goodbye.", "c2"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c2", text="goodbye."),
-            FrameDirection.DOWNSTREAM,
-        )
         await svc.push_frame(TTSStoppedFrame(context_id="c2"), FrameDirection.DOWNSTREAM)
 
         assert svc._cache_hits == 1
         assert svc._cache_misses == 3
-        assert len(svc.run_tts_calls) == 3  # parent called 3 times (not for "hello." hit)
+        assert len(svc.run_tts_calls) == 3
 
     @pytest.mark.asyncio
-    async def test_silence_frames_excluded_from_cache(self, backend):
-        """Silence frames with _tts_silence metadata should not be cached."""
+    async def test_silence_included_in_cached_audio(self, backend):
+        """Silence frames are included in cached audio (preserves inter-sentence spacing)."""
         svc = CachedMockTTS(cache_backend=backend)
 
         async for f in svc.run_tts("with silence.", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
 
-        # Push a silence frame (as pipecat would for inter-sentence silence)
+        # Push a silence frame — this triggers STORE for "with silence."
+        silence_audio = b"\x00" * 640
         silence = TTSAudioRawFrame(
-            audio=b"\x00" * 640,
-            sample_rate=_SAMPLE_RATE,
-            num_channels=1,
+            audio=silence_audio, sample_rate=_SAMPLE_RATE, num_channels=1,
         )
         silence.metadata["_tts_silence"] = True
         await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
 
-        await svc.push_frame(
-            TTSSentenceBoundaryFrame(context_id="c1", text="with silence."),
-            FrameDirection.DOWNSTREAM,
-        )
-        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
-
-        # Verify cached audio does not contain silence
         key = svc._generate_cache_key("with silence.")
         cached = await backend.get(key)
         assert cached is not None
-        assert cached.audio_chunks[0].audio == _FAKE_AUDIO  # only real audio
+        # Cached audio includes both the real audio AND the silence
+        assert cached.audio_chunks[0].audio == _FAKE_AUDIO + silence_audio
 
     @pytest.mark.asyncio
-    async def test_fallback_combined_caching_without_boundary_frames(self, backend):
-        """Without boundary frames, sentences fall back to combined-key caching."""
+    async def test_single_sentence_cached_on_stop_no_silence(self, backend):
+        """Single sentence (no trailing silence) is cached on TTSStoppedFrame."""
         svc = CachedMockTTS(cache_backend=backend)
 
-        # Two run_tts calls, no boundary frames
-        async for f in svc.run_tts("hello.", "c1"):
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-        async for f in svc.run_tts("how are you?", "c1"):
+        async for f in svc.run_tts("only sentence.", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
 
-        # Only TTSStoppedFrame (no boundary frames)
+        # No silence — just stop
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
-        # Should be cached as one combined entry
         stats = await backend.get_stats()
         assert stats["size"] == 1
 
-        combined_key = svc._generate_cache_key("hello. how are you?")
-        cached = await backend.get(combined_key)
+        key = svc._generate_cache_key("only sentence.")
+        cached = await backend.get(key)
         assert cached is not None
+        assert cached.audio_chunks[0].audio == _FAKE_AUDIO
 
 
 # ---------------------------------------------------------------------------
