@@ -104,6 +104,10 @@ class TTSCacheMixin:
         # keep _pending_texts alive for one cycle so late-arriving audio can
         # still be cached. Resolved at the start of the next run_tts call.
         self._deferred_finalize = False
+        # Track when a sentence boundary has been received but the following
+        # silence frame hasn't arrived yet.  Finalization is deferred until the
+        # silence frame is captured so it is included in the cached entry.
+        self._boundary_pending = False
 
         if self._enable_cache:
             logger.info(
@@ -294,32 +298,54 @@ class TTSCacheMixin:
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         """Override push_frame to intercept audio frames for caching."""
+        should_finalize = False
+
         if not self._is_from_cache(frame) and self._pending_texts:
-            # TTSSentenceBoundaryFrame: finalize the current sentence's audio
+            # TTSSentenceBoundaryFrame: mark boundary pending so the next
+            # silence frame is included in the current sentence's cache entry
+            # before we finalize.
             if TTSSentenceBoundaryFrame is not None and isinstance(
                 frame, TTSSentenceBoundaryFrame
             ):
-                await self._cache_current_sentence()
+                self._boundary_pending = True
                 # Don't pass boundary frames downstream
                 return
 
             if isinstance(frame, TTSAudioRawFrame):
-                # Skip silence frames (inter-sentence silence inserted by pipecat)
-                if not frame.metadata.get("_tts_silence"):
-                    chunk = CachedAudioChunk(
-                        audio=frame.audio,
-                        sample_rate=frame.sample_rate,
-                        num_channels=frame.num_channels,
-                        pts=getattr(frame, "pts", None),
-                    )
-                    self._current_audio_buffer.append(chunk)
+                chunk = CachedAudioChunk(
+                    audio=frame.audio,
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                    pts=getattr(frame, "pts", None),
+                )
+                self._current_audio_buffer.append(chunk)
+
+                # If a boundary was pending and this is the silence frame that
+                # follows it, finalize the sentence now that silence is captured.
+                if self._boundary_pending and frame.metadata.get("_tts_silence"):
+                    self._boundary_pending = False
+                    await self._cache_current_sentence()
+                # Non-silence audio after a boundary (edge case: no silence
+                # frame was emitted) — finalize the previous sentence anyway.
+                elif self._boundary_pending:
+                    self._boundary_pending = False
+                    await self._cache_current_sentence()
 
             elif isinstance(frame, TTSStoppedFrame):
-                # Fallback: if any pending texts remain (no boundary frames arrived),
-                # cache them as a combined entry.
-                await self._finalize_remaining()
+                # If a boundary was pending when stop arrives, finalize first.
+                if self._boundary_pending:
+                    self._boundary_pending = False
+                    await self._cache_current_sentence()
+                should_finalize = True
 
+        # Let the base class handle the frame first.  For TTSStoppedFrame the
+        # base TTSService.push_frame may re-entrantly push a silence
+        # TTSAudioRawFrame (push_silence_after_stop).  By deferring
+        # finalization the silence frame is captured before we write to cache.
         await super().push_frame(frame, direction)
+
+        if should_finalize:
+            await self._finalize_remaining()
 
     async def add_word_timestamps(
         self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
@@ -444,10 +470,12 @@ class TTSCacheMixin:
         self._pending_texts.clear()
         self._current_audio_buffer.clear()
         self._current_word_timestamps.clear()
+        self._boundary_pending = False
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruptions during TTS generation."""
         self._deferred_finalize = False
+        self._boundary_pending = False
         if self._pending_texts:
             logger.info(
                 f"{_LOG_PREFIX} INTERRUPT: clearing {len(self._pending_texts)} pending text(s)"
