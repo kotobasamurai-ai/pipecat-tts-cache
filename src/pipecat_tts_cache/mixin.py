@@ -8,20 +8,14 @@
 
 Design:
     Each run_tts("text") appends text to a FIFO queue (_pending_texts).
-    Audio frames arrive in order via push_frame.  Inter-sentence silence
-    frames (metadata["_tts_silence"]=True) delimit each sentence's audio.
-    TTSStoppedFrame finalizes the last sentence (which has no trailing silence).
+    Audio frames arrive in order via push_frame and are buffered.
+    TTSStoppedFrame finalizes the first pending text by storing its
+    buffered audio to cache, then discards any remaining pending texts.
 
     Timeline:
         run_tts("A") → pending=["A"]
-        run_tts("B") → pending=["A","B"]
         audio A ...
-        silence frame  → STORE "A", pop, clear buffer  (only when pending==1)
-        audio B ...
-        TTSStoppedFrame → STORE "B", pop, clear buffer
-
-    When pending >= 2 at a silence frame, audio-to-text mapping is unreliable,
-    so the buffer is cleared without storing.
+        TTSStoppedFrame → STORE "A", pop, clear buffer
 
     On cache hit with no pending MISS entries, audio is replayed from cache
     (zero latency).  If MISS entries are pending, HIT is skipped to preserve
@@ -44,7 +38,6 @@ from .key_generator import generate_cache_key
 from .models import CachedAudioChunk, CachedTTSResponse, CachedWordTimestamp
 
 _CACHE_ORIGIN_KEY = "_tts_cache_origin"
-_TTS_SILENCE_KEY = "_tts_silence"
 _BYTES_PER_PCM_SAMPLE = 2
 _LOG_PREFIX = "[TTS_CACHE]"
 
@@ -189,18 +182,6 @@ class TTSCacheMixin:
                         pts=getattr(frame, "pts", None),
                     )
                 )
-
-                if frame.metadata.get(_TTS_SILENCE_KEY):
-                    if len(self._pending_texts) == 1:
-                        await self._store_first_pending()
-                    else:
-                        # pending >= 2: audio-to-text mapping unreliable, discard buffer
-                        logger.warning(
-                            f"{_LOG_PREFIX} SILENCE_SKIP: {len(self._pending_texts)} pending, "
-                            f"clearing buffer ({sum(len(c.audio) for c in self._current_audio_buffer)}B)"
-                        )
-                        self._current_audio_buffer.clear()
-                        self._current_word_timestamps.clear()
 
             elif isinstance(frame, TTSStoppedFrame):
                 if self._pending_texts:

@@ -7,14 +7,12 @@
 """Tests for TTS caching mixin compatibility with current pipecat API.
 
 Tests cover:
-- Cache miss → stores audio, cache hit → replays with correct context_id
+- Cache miss → stores audio on TTSStoppedFrame, cache hit → replays
 - run_tts passes context_id through to parent
 - Replayed frames carry context_id
 - Interruption clears batch state
 - Word timestamps forwarded with context_id
-- Per-sentence caching via TTSSentenceBoundaryFrame
-- Fallback combined caching when no boundary frames
-- Silence frame exclusion from cache
+- Silence frames buffered as audio (not used as delimiters)
 - Cache key generation uses _settings.voice / _settings.model
 - Cache disabled when no backend provided
 - Cache stats tracking
@@ -610,106 +608,15 @@ class TestBatchFinalization:
         assert stats["size"] == 0
 
     @pytest.mark.asyncio
-    async def test_per_sentence_caching_with_silence_delimiter(self, backend):
-        """With pending==1, silence frame triggers STORE. With pending>=2, buffer is cleared."""
-        svc = CachedMockTTS(cache_backend=backend)
-
-        # Single run_tts → pending==1, silence should trigger STORE
-        frames1 = []
-        async for f in svc.run_tts("only sentence.", "c1"):
-            frames1.append(f)
-
-        for f in frames1:
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-
-        silence = TTSAudioRawFrame(
-            audio=b"\x00" * 640, sample_rate=_SAMPLE_RATE, num_channels=1,
-        )
-        silence.metadata["_tts_silence"] = True
-        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
-
-        stats = await backend.get_stats()
-        assert stats["size"] == 1
-
-        key1 = svc._generate_cache_key("only sentence.")
-        assert await backend.get(key1) is not None
-
-    @pytest.mark.asyncio
-    async def test_silence_skips_store_when_multiple_pending(self, backend):
-        """With pending>=2, silence frame clears buffer without storing."""
-        svc = CachedMockTTS(cache_backend=backend)
-
-        # Two run_tts calls → pending==2
-        frames1 = []
-        async for f in svc.run_tts("first sentence.", "c1"):
-            frames1.append(f)
-        frames2 = []
-        async for f in svc.run_tts("second sentence.", "c1"):
-            frames2.append(f)
-
-        # Audio for first sentence arrives
-        for f in frames1:
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-
-        # Silence frame with pending==2 → buffer cleared, no STORE
-        silence = TTSAudioRawFrame(
-            audio=b"\x00" * 640, sample_rate=_SAMPLE_RATE, num_channels=1,
-        )
-        silence.metadata["_tts_silence"] = True
-        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
-
-        # Buffer cleared but pending texts remain
-        assert len(svc._current_audio_buffer) == 0
-        assert len(svc._pending_texts) == 2
-
-        # Audio for second sentence arrives
-        for f in frames2:
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-
-        # TTSStoppedFrame stores "first sentence." (first pending) and discards "second"
-        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
-
-        # Only the last sentence's audio was stored under the first pending text
-        stats = await backend.get_stats()
-        assert stats["size"] == 1
-
-    @pytest.mark.asyncio
-    async def test_single_sentence_cache_hit_via_silence(self, backend):
-        """Single sentence (pending==1) cached via silence, then hit on replay."""
-        svc = CachedMockTTS(cache_backend=backend)
-
-        # First turn: single sentence, silence triggers STORE
-        async for f in svc.run_tts("hello.", "c1"):
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-
-        silence = TTSAudioRawFrame(
-            audio=b"\x00" * 640, sample_rate=_SAMPLE_RATE, num_channels=1,
-        )
-        silence.metadata["_tts_silence"] = True
-        await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
-
-        assert svc._cache_misses == 1
-        assert svc._cache_hits == 0
-
-        # Second turn: "hello." should hit (no pending)
-        async for _ in svc.run_tts("hello.", "c2"):
-            pass
-        assert svc._cache_hits == 1
-
-    @pytest.mark.asyncio
-    async def test_silence_included_in_cached_audio(self, backend):
-        """Silence frames are included in cached audio (preserves inter-sentence spacing)."""
+    async def test_silence_frames_buffered_not_used_as_delimiter(self, backend):
+        """Silence frames are buffered as audio, not used as store triggers."""
         svc = CachedMockTTS(cache_backend=backend)
 
         async for f in svc.run_tts("with silence.", "c1"):
             if isinstance(f, TTSAudioRawFrame):
                 await svc.push_frame(f, FrameDirection.DOWNSTREAM)
 
-        # Push a silence frame — this triggers STORE for "with silence."
+        # Silence frame is just another audio frame — no STORE yet
         silence_audio = b"\x00" * 640
         silence = TTSAudioRawFrame(
             audio=silence_audio, sample_rate=_SAMPLE_RATE, num_channels=1,
@@ -717,31 +624,20 @@ class TestBatchFinalization:
         silence.metadata["_tts_silence"] = True
         await svc.push_frame(silence, FrameDirection.DOWNSTREAM)
 
-        key = svc._generate_cache_key("with silence.")
-        cached = await backend.get(key)
-        assert cached is not None
-        # Cached audio includes both the real audio AND the silence
-        assert cached.audio_chunks[0].audio == _FAKE_AUDIO + silence_audio
+        # Not stored yet — still pending
+        assert len(svc._pending_texts) == 1
+        assert len(svc._current_audio_buffer) == 2
 
-    @pytest.mark.asyncio
-    async def test_single_sentence_cached_on_stop_no_silence(self, backend):
-        """Single sentence (no trailing silence) is cached on TTSStoppedFrame."""
-        svc = CachedMockTTS(cache_backend=backend)
-
-        async for f in svc.run_tts("only sentence.", "c1"):
-            if isinstance(f, TTSAudioRawFrame):
-                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
-
-        # No silence — just stop
+        # TTSStoppedFrame triggers STORE (includes silence in cached audio)
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
         stats = await backend.get_stats()
         assert stats["size"] == 1
 
-        key = svc._generate_cache_key("only sentence.")
+        key = svc._generate_cache_key("with silence.")
         cached = await backend.get(key)
         assert cached is not None
-        assert cached.audio_chunks[0].audio == _FAKE_AUDIO
+        assert cached.audio_chunks[0].audio == _FAKE_AUDIO + silence_audio
 
 
 # ---------------------------------------------------------------------------
