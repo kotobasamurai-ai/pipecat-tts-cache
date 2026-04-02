@@ -590,17 +590,24 @@ class TestBatchFinalization:
         assert stats["size"] == 1
 
     @pytest.mark.asyncio
-    async def test_no_audio_skips_cache(self, backend):
-        """If no audio was collected, TTSStoppedFrame should not cache."""
+    async def test_no_audio_defers_then_discards(self, backend):
+        """If no audio arrived, TTSStoppedFrame defers; next run_tts discards."""
         svc = CachedMockTTS(cache_backend=backend)
 
         # run_tts without pushing any audio frames
         async for _ in svc.run_tts("empty", "c1"):
             pass
-        # Only push stop frame (no audio arrived)
+        # Stop frame with no audio → deferred
         await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
 
-        assert len(svc._pending_texts) == 0
+        assert svc._deferred is True
+        assert len(svc._pending_texts) == 1  # still pending
+
+        # Next run_tts resolves deferred state — discards since no audio came
+        async for _ in svc.run_tts("next", "c2"):
+            pass
+        assert svc._deferred is False
+        assert "empty" not in svc._pending_texts
         stats = await backend.get_stats()
         assert stats["size"] == 0
 

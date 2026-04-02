@@ -71,6 +71,9 @@ class TTSCacheMixin:
         self._current_audio_buffer: List[CachedAudioChunk] = []
         self._current_word_timestamps: List[Tuple[str, float]] = []
         self._serving_from_cache = False
+        # When TTSStoppedFrame arrives before audio (TTFB > stop_frame_timeout),
+        # defer finalization so late-arriving audio can still be cached.
+        self._deferred = False
 
         if cache_backend:
             logger.info(
@@ -114,6 +117,24 @@ class TTSCacheMixin:
             async for frame in super().run_tts(text, context_id):
                 yield frame
             return
+
+        # Resolve deferred state from previous run_tts whose audio
+        # arrived after TTSStoppedFrame (TTFB > stop_frame_timeout).
+        if self._deferred:
+            self._deferred = False
+            if self._current_audio_buffer and self._pending_texts:
+                logger.info(
+                    f"{_LOG_PREFIX} DEFERRED_STORE: '{self._pending_texts[0][:50]}' "
+                    f"({sum(len(c.audio) for c in self._current_audio_buffer)}B arrived late)"
+                )
+                await self._store_first_pending()
+            # Discard any remaining deferred texts
+            if self._pending_texts:
+                logger.warning(
+                    f"{_LOG_PREFIX} DEFERRED_DISCARD: {len(self._pending_texts)} text(s) "
+                    f"(audio never arrived)"
+                )
+                self._clear_state()
 
         cache_key = self._generate_cache_key(text)
         cached = await self._safe_cache_get(cache_key)
@@ -180,18 +201,25 @@ class TTSCacheMixin:
                     await self._store_first_pending()
 
             elif isinstance(frame, TTSStoppedFrame):
-                # Last sentence has no trailing silence — store on stop
                 if self._pending_texts:
                     if self._current_audio_buffer:
+                        # Audio available — store first pending
                         await self._store_first_pending()
-                    # Discard any remaining pending texts (no audio to attribute)
-                    if self._pending_texts:
-                        logger.warning(
-                            f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
-                            f"on stop (no delimiter): "
-                            f"{[t[:30] for t in self._pending_texts]}"
+                        # Discard any remaining (no delimiter to split)
+                        if self._pending_texts:
+                            logger.warning(
+                                f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
+                                f"on stop (no delimiter): "
+                                f"{[t[:30] for t in self._pending_texts]}"
+                            )
+                            self._clear_state()
+                    else:
+                        # No audio yet (TTFB > stop_frame_timeout) — defer
+                        self._deferred = True
+                        logger.info(
+                            f"{_LOG_PREFIX} DEFER: {len(self._pending_texts)} text(s) "
+                            f"(no audio yet, waiting for late arrival)"
                         )
-                        self._clear_state()
 
         await super().push_frame(frame, direction)
 
@@ -289,6 +317,7 @@ class TTSCacheMixin:
         self._pending_texts.clear()
         self._current_audio_buffer.clear()
         self._current_word_timestamps.clear()
+        self._deferred = False
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         if self._pending_texts:
