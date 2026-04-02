@@ -16,9 +16,12 @@ Design:
         run_tts("A") → pending=["A"]
         run_tts("B") → pending=["A","B"]
         audio A ...
-        silence frame  → STORE "A", pop, clear buffer
+        silence frame  → STORE "A", pop, clear buffer  (only when pending==1)
         audio B ...
         TTSStoppedFrame → STORE "B", pop, clear buffer
+
+    When pending >= 2 at a silence frame, audio-to-text mapping is unreliable,
+    so the buffer is cleared without storing.
 
     On cache hit with no pending MISS entries, audio is replayed from cache
     (zero latency).  If MISS entries are pending, HIT is skipped to preserve
@@ -32,7 +35,6 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     TTSAudioRawFrame,
-    TTSStartedFrame,
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -42,6 +44,7 @@ from .key_generator import generate_cache_key
 from .models import CachedAudioChunk, CachedTTSResponse, CachedWordTimestamp
 
 _CACHE_ORIGIN_KEY = "_tts_cache_origin"
+_TTS_SILENCE_KEY = "_tts_silence"
 _BYTES_PER_PCM_SAMPLE = 2
 _LOG_PREFIX = "[TTS_CACHE]"
 
@@ -108,9 +111,10 @@ class TTSCacheMixin:
             namespace=self._cache_namespace,
         )
 
-    # ------------------------------------------------------------------
-    # run_tts: cache lookup / miss passthrough
-    # ------------------------------------------------------------------
+    def _hit_rate_str(self) -> str:
+        total = self._cache_hits + self._cache_misses
+        pct = (self._cache_hits / total * 100) if total > 0 else 0
+        return f"[{self._cache_hits}/{total} = {pct:.0f}%]"
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         if not self._cache_backend:
@@ -128,7 +132,6 @@ class TTSCacheMixin:
                     f"({sum(len(c.audio) for c in self._current_audio_buffer)}B arrived late)"
                 )
                 await self._store_first_pending()
-            # Discard any remaining deferred texts
             if self._pending_texts:
                 logger.warning(
                     f"{_LOG_PREFIX} DEFERRED_DISCARD: {len(self._pending_texts)} text(s) "
@@ -140,15 +143,13 @@ class TTSCacheMixin:
         cached = await self._safe_cache_get(cache_key)
 
         if cached and not self._pending_texts:
-            # HIT — replay from cache
             self._cache_hits += 1
             self._serving_from_cache = True
-            total = self._cache_hits + self._cache_misses
             logger.info(
                 f"{_LOG_PREFIX} HIT: '{text[:50]}' "
                 f"({cached.metadata.get('audio_bytes', '?')}B, "
                 f"{cached.total_duration_s:.1f}s) "
-                f"[{self._cache_hits}/{total} = {self._cache_hits/total*100:.0f}%]"
+                f"{self._hit_rate_str()}"
             )
             try:
                 async for frame in self._yield_cached_frames(cached, context_id):
@@ -157,7 +158,6 @@ class TTSCacheMixin:
                 self._serving_from_cache = False
             return
 
-        # MISS (or HIT skipped because earlier MISS is pending)
         if cached and self._pending_texts:
             logger.info(
                 f"{_LOG_PREFIX} HIT_SKIP: '{text[:50]}' "
@@ -165,10 +165,8 @@ class TTSCacheMixin:
             )
 
         self._cache_misses += 1
-        total = self._cache_hits + self._cache_misses
         logger.info(
-            f"{_LOG_PREFIX} MISS: '{text[:50]}' "
-            f"[{self._cache_hits}/{total} = {self._cache_hits/total*100:.0f}%]"
+            f"{_LOG_PREFIX} MISS: '{text[:50]}' {self._hit_rate_str()}"
         )
 
         self._pending_texts.append(text)
@@ -179,10 +177,6 @@ class TTSCacheMixin:
         except Exception:
             self._clear_state()
             raise
-
-    # ------------------------------------------------------------------
-    # push_frame: intercept audio for caching
-    # ------------------------------------------------------------------
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if not self._is_from_cache(frame) and self._pending_texts:
@@ -196,16 +190,22 @@ class TTSCacheMixin:
                     )
                 )
 
-                # Silence frame = end of current sentence's audio
-                if frame.metadata.get("_tts_silence"):
-                    await self._store_first_pending()
+                if frame.metadata.get(_TTS_SILENCE_KEY):
+                    if len(self._pending_texts) == 1:
+                        await self._store_first_pending()
+                    else:
+                        # pending >= 2: audio-to-text mapping unreliable, discard buffer
+                        logger.warning(
+                            f"{_LOG_PREFIX} SILENCE_SKIP: {len(self._pending_texts)} pending, "
+                            f"clearing buffer ({sum(len(c.audio) for c in self._current_audio_buffer)}B)"
+                        )
+                        self._current_audio_buffer.clear()
+                        self._current_word_timestamps.clear()
 
             elif isinstance(frame, TTSStoppedFrame):
                 if self._pending_texts:
                     if self._current_audio_buffer:
-                        # Audio available — store first pending
                         await self._store_first_pending()
-                        # Discard any remaining (no delimiter to split)
                         if self._pending_texts:
                             logger.warning(
                                 f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
@@ -214,7 +214,6 @@ class TTSCacheMixin:
                             )
                             self._clear_state()
                     else:
-                        # No audio yet (TTFB > stop_frame_timeout) — defer
                         self._deferred = True
                         logger.info(
                             f"{_LOG_PREFIX} DEFER: {len(self._pending_texts)} text(s) "
@@ -223,18 +222,10 @@ class TTSCacheMixin:
 
         await super().push_frame(frame, direction)
 
-    # ------------------------------------------------------------------
-    # Metrics: skip on cache hits
-    # ------------------------------------------------------------------
-
     async def start_tts_usage_metrics(self, text: str):
         if self._serving_from_cache:
             return
         await super().start_tts_usage_metrics(text)
-
-    # ------------------------------------------------------------------
-    # Word timestamps
-    # ------------------------------------------------------------------
 
     async def add_word_timestamps(
         self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
@@ -244,10 +235,6 @@ class TTSCacheMixin:
             self._current_word_timestamps.extend(filtered)
         if hasattr(super(), "add_word_timestamps"):
             await super().add_word_timestamps(word_times, context_id=context_id)
-
-    # ------------------------------------------------------------------
-    # Storage
-    # ------------------------------------------------------------------
 
     async def _store_first_pending(self):
         """Store current audio buffer under the first pending text, then pop it."""
@@ -286,10 +273,6 @@ class TTSCacheMixin:
             self._current_audio_buffer.clear()
             self._current_word_timestamps.clear()
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     async def _safe_cache_get(self, key: str) -> Optional[CachedTTSResponse]:
         try:
             return await self._cache_backend.get(key)
@@ -327,10 +310,6 @@ class TTSCacheMixin:
             self._clear_state()
         if hasattr(super(), "_handle_interruption"):
             await super()._handle_interruption(frame, direction)
-
-    # ------------------------------------------------------------------
-    # Stats / management
-    # ------------------------------------------------------------------
 
     async def get_cache_stats(self) -> Dict[str, Any]:
         total = self._cache_hits + self._cache_misses
