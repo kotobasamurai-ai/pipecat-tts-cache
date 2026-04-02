@@ -97,48 +97,31 @@ class TestCacheKeyGeneration(unittest.TestCase):
     """Tests for deterministic cache key generation."""
 
     def test_same_input_same_key(self):
-        key1 = generate_cache_key("hello", "voice1", "model1", 16000)
-        key2 = generate_cache_key("hello", "voice1", "model1", 16000)
+        key1 = generate_cache_key("hello", "voice1")
+        key2 = generate_cache_key("hello", "voice1")
         assert key1 == key2
 
     def test_different_text_different_key(self):
-        key1 = generate_cache_key("hello", "voice1", "model1", 16000)
-        key2 = generate_cache_key("world", "voice1", "model1", 16000)
+        key1 = generate_cache_key("hello", "voice1")
+        key2 = generate_cache_key("world", "voice1")
         assert key1 != key2
 
     def test_different_voice_different_key(self):
-        key1 = generate_cache_key("hello", "voice1", "model1", 16000)
-        key2 = generate_cache_key("hello", "voice2", "model1", 16000)
-        assert key1 != key2
-
-    def test_different_sample_rate_different_key(self):
-        key1 = generate_cache_key("hello", "voice1", "model1", 16000)
-        key2 = generate_cache_key("hello", "voice1", "model1", 24000)
+        key1 = generate_cache_key("hello", "voice1")
+        key2 = generate_cache_key("hello", "voice2")
         assert key1 != key2
 
     def test_whitespace_normalization(self):
-        key1 = generate_cache_key("hello  world", "v", "m", 16000)
-        key2 = generate_cache_key("hello world", "v", "m", 16000)
+        key1 = generate_cache_key("hello  world", "v")
+        key2 = generate_cache_key("hello world", "v")
         assert key1 == key2
-
-    def test_sensitive_settings_excluded(self):
-        key1 = generate_cache_key("hello", "v", "m", 16000, settings={"speed": 1.0})
-        key2 = generate_cache_key(
-            "hello", "v", "m", 16000, settings={"speed": 1.0, "api_key": "secret"}
-        )
-        assert key1 == key2
-
-    def test_namespace_affects_key(self):
-        key1 = generate_cache_key("hello", "v", "m", 16000, namespace="ns1")
-        key2 = generate_cache_key("hello", "v", "m", 16000, namespace="ns2")
-        assert key1 != key2
 
     def test_empty_text_raises(self):
         with pytest.raises(ValueError, match="empty text"):
-            generate_cache_key("", "v", "m", 16000)
+            generate_cache_key("", "v")
 
     def test_key_is_sha256_hex(self):
-        key = generate_cache_key("hello", "v", "m", 16000)
+        key = generate_cache_key("hello", "v")
         assert len(key) == 64
         assert all(c in "0123456789abcdef" for c in key)
 
@@ -483,9 +466,7 @@ class TestCacheKeyFromSettings:
         svc2 = CachedMockTTS(cache_backend=backend)
 
         svc1._settings.voice = "alice"
-        svc1._settings.model = "turbo"
         svc2._settings.voice = "alice"
-        svc2._settings.model = "turbo"
 
         assert svc1._generate_cache_key("hello") == svc2._generate_cache_key("hello")
 

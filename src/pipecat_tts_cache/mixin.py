@@ -78,30 +78,14 @@ class TTSCacheMixin:
             )
 
     def _generate_cache_key(self, text: str) -> str:
-        voice_id = "default"
-        model = "default"
-        settings_dict: Dict[str, Any] = {}
-
         if hasattr(self, "_settings"):
-            settings_obj = self._settings
-            voice_id = getattr(settings_obj, "voice", None) or "default"
-            model = getattr(settings_obj, "model", None) or "default"
-            if hasattr(settings_obj, "given_fields"):
-                settings_dict = settings_obj.given_fields()
+            voice_id = getattr(self._settings, "voice", None) or "default"
         else:
             voice_id = getattr(self, "_voice_id", "default")
-            model = getattr(self, "model_name", "default")
-            settings_dict = getattr(self, "_settings", {})
-            if not isinstance(settings_dict, dict):
-                settings_dict = {}
 
         return generate_cache_key(
             text=text,
             voice_id=str(voice_id),
-            model=str(model),
-            sample_rate=getattr(self, "sample_rate", 16000),
-            settings=settings_dict,
-            namespace=self._cache_namespace,
         )
 
     def _hit_rate_str(self) -> str:
