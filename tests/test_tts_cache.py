@@ -827,6 +827,109 @@ class TestErrorHandling:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Tests: cache_write_enabled=False (read-only mode)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheWriteDisabled:
+    """When cache_write_enabled=False, writes (STORE/DEFER) are skipped but reads (HIT) work."""
+
+    @pytest.fixture
+    def backend(self):
+        return MemoryCacheBackend(max_size=100)
+
+    def _make_readonly_service(self, backend):
+        return CachedMockTTS(cache_backend=backend, cache_write_enabled=False)
+
+    @pytest.mark.asyncio
+    async def test_miss_does_not_store(self, backend):
+        """With write disabled, a MISS should NOT populate the cache."""
+        svc = self._make_readonly_service(backend)
+
+        frames = []
+        async for f in svc.run_tts("no store", "c1"):
+            frames.append(f)
+
+        # Push audio + stop as the pipeline would
+        for f in frames:
+            if isinstance(f, TTSAudioRawFrame):
+                await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        # Cache should remain empty
+        stats = await backend.get_stats()
+        assert stats["size"] == 0
+        assert svc._cache_misses == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_texts_stays_empty(self, backend):
+        """With write disabled, _pending_texts is never appended to."""
+        svc = self._make_readonly_service(backend)
+
+        async for _ in svc.run_tts("no pending", "c1"):
+            pass
+
+        assert len(svc._pending_texts) == 0
+
+    @pytest.mark.asyncio
+    async def test_deferred_not_triggered(self, backend):
+        """With write disabled, DEFER logic should not activate."""
+        svc = self._make_readonly_service(backend)
+
+        async for _ in svc.run_tts("no defer", "c1"):
+            pass
+        # Stop with no audio — would normally defer
+        await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        assert svc._deferred is False
+
+    @pytest.mark.asyncio
+    async def test_hit_still_works_from_prepopulated_cache(self, backend):
+        """Pre-populated cache entries are served even with write disabled."""
+        # Pre-populate with a writable service
+        writer = CachedMockTTS(cache_backend=backend, cache_write_enabled=True)
+        frames = []
+        async for f in writer.run_tts("cached phrase", "c1"):
+            frames.append(f)
+        for f in frames:
+            if isinstance(f, TTSAudioRawFrame):
+                await writer.push_frame(f, FrameDirection.DOWNSTREAM)
+        await writer.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        stats = await backend.get_stats()
+        assert stats["size"] == 1
+
+        # Now use read-only service
+        reader = self._make_readonly_service(backend)
+        hit_frames = []
+        async for f in reader.run_tts("cached phrase", "c2"):
+            hit_frames.append(f)
+
+        assert reader._cache_hits == 1
+        assert len(reader.run_tts_calls) == 0  # parent NOT called
+        assert any(isinstance(f, TTSAudioRawFrame) for f in hit_frames)
+
+    @pytest.mark.asyncio
+    async def test_consecutive_misses_no_accumulation(self, backend):
+        """Multiple MISSes with write disabled should not accumulate pending state."""
+        svc = self._make_readonly_service(backend)
+
+        for text in ["first", "second", "third"]:
+            async for f in svc.run_tts(text, "c1"):
+                if isinstance(f, TTSAudioRawFrame):
+                    await svc.push_frame(f, FrameDirection.DOWNSTREAM)
+            await svc.push_frame(TTSStoppedFrame(context_id="c1"), FrameDirection.DOWNSTREAM)
+
+        assert len(svc._pending_texts) == 0
+        assert len(svc._current_audio_buffer) == 0
+        assert svc._cache_misses == 3
+
+        # Cache still empty
+        stats = await backend.get_stats()
+        assert stats["size"] == 0
+
+
 class TestFullPipelineIntegration:
     """Integration tests that run the cached TTS through a real pipecat pipeline."""
 

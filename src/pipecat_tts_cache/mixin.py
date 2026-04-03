@@ -54,12 +54,14 @@ class TTSCacheMixin:
         cache_backend: Optional[CacheBackend] = None,
         cache_ttl: Optional[int] = 5184000,
         cache_namespace: Optional[str] = None,
+        cache_write_enabled: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._cache_backend = cache_backend
         self._cache_ttl = cache_ttl
         self._cache_namespace = cache_namespace
+        self._cache_write_enabled = cache_write_enabled
 
         self._cache_hits = 0
         self._cache_misses = 0
@@ -117,7 +119,7 @@ class TTSCacheMixin:
 
         # Resolve deferred state from previous run_tts whose audio
         # arrived after TTSStoppedFrame (TTFB > stop_frame_timeout).
-        if self._deferred:
+        if self._deferred and self._cache_write_enabled:
             self._deferred = False
             if self._current_audio_buffer and self._pending_texts:
                 logger.info(
@@ -162,7 +164,8 @@ class TTSCacheMixin:
             f"{_LOG_PREFIX} MISS: '{text[:50]}' {self._hit_rate_str()}"
         )
 
-        self._pending_texts.append(text)
+        if self._cache_write_enabled:
+            self._pending_texts.append(text)
 
         try:
             async for frame in super().run_tts(text, context_id):
