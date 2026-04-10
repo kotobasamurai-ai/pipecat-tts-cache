@@ -7,19 +7,19 @@
 """TTS caching mixin for Fish Audio WebSocket TTS.
 
 Design:
-    Each run_tts("text") appends text to a FIFO queue (_pending_texts).
-    Audio frames arrive in order via push_frame and are buffered.
-    TTSStoppedFrame finalizes the first pending text by storing its
-    buffered audio to cache, then discards any remaining pending texts.
+    Only the FIRST sentence in each turn is eligible for caching (both
+    read and write).  All subsequent sentences bypass the cache entirely
+    and are always generated live by the TTS engine.
 
-    Timeline:
-        run_tts("A") → pending=["A"]
-        audio A ...
-        TTSStoppedFrame → STORE "A", pop, clear buffer
+    This avoids the MISS→HIT ordering problem where cached audio for a
+    later sentence arrives before live audio for an earlier sentence,
+    causing garbled playback.
 
-    On cache hit with no pending MISS entries, audio is replayed from cache
-    (zero latency).  If MISS entries are pending, HIT is skipped to preserve
-    playback order (Fish Audio returns audio in send order).
+    Timeline (single turn):
+        run_tts("A") → first in turn → cache lookup → HIT or MISS+STORE
+        run_tts("B") → not first   → always MISS, no STORE
+        run_tts("C") → not first   → always MISS, no STORE
+        on_turn_context_completed() → reset for next turn
 """
 
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -65,17 +65,18 @@ class TTSCacheMixin:
 
         self._cache_hits = 0
         self._cache_misses = 0
-        self._pending_texts: List[str] = []
+        # Only the first sentence per turn uses cache (read/write).
+        # After the first run_tts in a turn, this flag is set True and
+        # all subsequent sentences bypass cache entirely.
+        self._turn_first_done = False
+        # State for caching the first sentence's audio
+        self._pending_text: Optional[str] = None
         self._current_audio_buffer: List[CachedAudioChunk] = []
         self._current_word_timestamps: List[Tuple[str, float]] = []
         self._serving_from_cache = False
         # When TTSStoppedFrame arrives before audio (TTFB > stop_frame_timeout),
         # defer finalization so late-arriving audio can still be cached.
         self._deferred = False
-        # When a cache MISS occurs in a turn, all subsequent HITs in the same
-        # turn must be skipped (HIT_SKIP) to preserve audio playback order.
-        # Reset on turn completion or interruption.
-        self._turn_has_async_miss = False
 
         if cache_backend:
             logger.info(
@@ -121,31 +122,41 @@ class TTSCacheMixin:
                 yield frame
             return
 
-        # Resolve deferred state from previous run_tts whose audio
+        # --- Not the first sentence in this turn: bypass cache entirely ---
+        if self._turn_first_done:
+            logger.debug(
+                f"{_LOG_PREFIX} SKIP (not first in turn): '{text[:50]}'"
+            )
+            async for frame in super().run_tts(text, context_id):
+                yield frame
+            return
+
+        # --- First sentence in this turn ---
+        self._turn_first_done = True
+
+        # Resolve deferred state from previous turn whose audio
         # arrived after TTSStoppedFrame (TTFB > stop_frame_timeout).
         if self._deferred and self._cache_write_enabled:
             self._deferred = False
-            if self._current_audio_buffer and self._pending_texts:
+            if self._current_audio_buffer and self._pending_text:
                 logger.info(
-                    f"{_LOG_PREFIX} DEFERRED_STORE: '{self._pending_texts[0][:50]}' "
+                    f"{_LOG_PREFIX} DEFERRED_STORE: '{self._pending_text[:50]}' "
                     f"({sum(len(c.audio) for c in self._current_audio_buffer)}B arrived late)"
                 )
-                await self._store_first_pending()
-            elif self._pending_texts:
-                discarded = self._pending_texts.pop(0)
+                await self._store_pending()
+            elif self._pending_text:
                 logger.warning(
-                    f"{_LOG_PREFIX} DEFERRED_DISCARD: '{discarded[:50]}' "
+                    f"{_LOG_PREFIX} DEFERRED_DISCARD: '{self._pending_text[:50]}' "
                     f"(audio never arrived)"
                 )
+                self._pending_text = None
                 self._current_audio_buffer.clear()
                 self._current_word_timestamps.clear()
-            if not self._pending_texts:
-                self._turn_has_async_miss = False
 
         cache_key = self._generate_cache_key(text)
         cached = await self._safe_cache_get(cache_key)
 
-        if cached and not self._pending_texts and not self._turn_has_async_miss:
+        if cached:
             self._cache_hits += 1
             self._serving_from_cache = True
             logger.info(
@@ -161,21 +172,13 @@ class TTSCacheMixin:
                 self._serving_from_cache = False
             return
 
-        if cached and (self._pending_texts or self._turn_has_async_miss):
-            logger.info(
-                f"{_LOG_PREFIX} HIT_SKIP: '{text[:50]}' "
-                f"({len(self._pending_texts)} MISS pending, "
-                f"turn_has_async_miss={self._turn_has_async_miss})"
-            )
-
         self._cache_misses += 1
         logger.info(
             f"{_LOG_PREFIX} MISS: '{text[:50]}' {self._hit_rate_str()}"
         )
 
         if self._cache_write_enabled:
-            self._pending_texts.append(text)
-            self._turn_has_async_miss = True
+            self._pending_text = text
 
         try:
             async for frame in super().run_tts(text, context_id):
@@ -185,7 +188,7 @@ class TTSCacheMixin:
             raise
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
-        if not self._is_from_cache(frame) and self._pending_texts:
+        if not self._is_from_cache(frame) and self._pending_text:
             if isinstance(frame, TTSAudioRawFrame):
                 self._current_audio_buffer.append(
                     CachedAudioChunk(
@@ -197,24 +200,14 @@ class TTSCacheMixin:
                 )
 
             elif isinstance(frame, TTSStoppedFrame):
-                if self._pending_texts:
-                    if self._current_audio_buffer:
-                        await self._store_first_pending()
-                        if self._pending_texts:
-                            logger.warning(
-                                f"{_LOG_PREFIX} DISCARD: {len(self._pending_texts)} text(s) "
-                                f"on stop (no delimiter): "
-                                f"{[t[:30] for t in self._pending_texts]}"
-                            )
-                            self._clear_state()
-                        else:
-                            self._turn_has_async_miss = False
-                    else:
-                        self._deferred = True
-                        logger.info(
-                            f"{_LOG_PREFIX} DEFER: {len(self._pending_texts)} text(s) "
-                            f"(no audio yet, waiting for late arrival)"
-                        )
+                if self._current_audio_buffer:
+                    await self._store_pending()
+                else:
+                    self._deferred = True
+                    logger.info(
+                        f"{_LOG_PREFIX} DEFER: '{self._pending_text[:50]}' "
+                        f"(no audio yet, waiting for late arrival)"
+                    )
 
         await super().push_frame(frame, direction)
 
@@ -227,17 +220,18 @@ class TTSCacheMixin:
         self, word_times: List[Tuple[str, float]], context_id: Optional[str] = None
     ):
         filtered = [(w, t) for w, t in word_times if w not in ("TTSStoppedFrame", "Reset")]
-        if self._pending_texts and filtered:
+        if self._pending_text and filtered:
             self._current_word_timestamps.extend(filtered)
         if hasattr(super(), "add_word_timestamps"):
             await super().add_word_timestamps(word_times, context_id=context_id)
 
-    async def _store_first_pending(self):
-        """Store current audio buffer under the first pending text, then pop it."""
-        if not self._pending_texts or not self._current_audio_buffer:
+    async def _store_pending(self):
+        """Store current audio buffer under the pending text, then clear it."""
+        if not self._pending_text or not self._current_audio_buffer:
             return
 
-        text = self._pending_texts.pop(0)
+        text = self._pending_text
+        self._pending_text = None
         all_audio = b"".join(c.audio for c in self._current_audio_buffer)
         sample_rate = self._current_audio_buffer[0].sample_rate
         num_channels = self._current_audio_buffer[0].num_channels
@@ -293,23 +287,23 @@ class TTSCacheMixin:
         return frame.metadata.get(_CACHE_ORIGIN_KEY, False)
 
     def _clear_state(self) -> None:
-        self._pending_texts.clear()
+        self._pending_text = None
         self._current_audio_buffer.clear()
         self._current_word_timestamps.clear()
         self._deferred = False
-        self._turn_has_async_miss = False
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
-        if self._pending_texts:
+        if self._pending_text:
             logger.info(
-                f"{_LOG_PREFIX} INTERRUPT: clearing {len(self._pending_texts)} pending"
+                f"{_LOG_PREFIX} INTERRUPT: clearing pending '{self._pending_text[:50]}'"
             )
-            self._clear_state()
+        self._clear_state()
+        self._turn_first_done = False
         if hasattr(super(), "_handle_interruption"):
             await super()._handle_interruption(frame, direction)
 
     async def on_turn_context_completed(self):
-        self._turn_has_async_miss = False
+        self._turn_first_done = False
         if hasattr(super(), "on_turn_context_completed"):
             await super().on_turn_context_completed()
 
