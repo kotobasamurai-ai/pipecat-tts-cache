@@ -12,7 +12,7 @@ authors = [
     { name = "Om Chauhan", email = "omchauhan64408@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["pipecat", "tts", "cache", "voice", "ai", "text-to-speech"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "pipecat-ai>=0.0.91",
+    "pipecat-ai @ git+https://github.com/kotobasamurai-ai/pipecat.git@custom",
     "loguru~=0.7.3",
 ]
 
@@ -36,7 +36,7 @@ Changelog = "https://github.com/omChauhanDev/pipecat-tts-cache/blob/main/CHANGEL
 [project.optional-dependencies]
 redis = ["redis>=5.0.0"]
 examples = [
-    "pipecat-ai[silero,cartesia,deepgram,google,daily,webrtc,runner]>=0.0.98",
+    "pipecat-ai[silero,cartesia,deepgram,google,daily,webrtc,runner] @ git+https://github.com/kotobasamurai-ai/pipecat.git@custom",
 ]
 all = ["pipecat-tts-cache[redis,examples]"]
 
